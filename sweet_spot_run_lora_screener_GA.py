@@ -10,7 +10,7 @@ D) 可选 --force_cuda0 强制把模型放到 cuda:0，减少 offload（默认�
 E) PPL评估优化：确保模型在正确状态下评估，避免训练状态干扰
 """
 
-import os, json, time, math, argparse, gc
+import os, json, time, math, argparse, gc, csv
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ from accelerate import Accelerator
 import re
 
 from datasets import load_dataset, load_from_disk
+import esm
 
 try:
     from lm_eval import simple_evaluate
@@ -831,6 +832,607 @@ def load_train_texts(name="wikitext", config="wikitext-2-raw-v1", split="train",
     return texts
 
 
+def parse_target_modules(target_modules_arg):
+    if isinstance(target_modules_arg, (list, tuple)):
+        return [str(x).strip() for x in target_modules_arg if str(x).strip()]
+    if target_modules_arg is None:
+        return []
+    if isinstance(target_modules_arg, str):
+        try:
+            parsed = json.loads(target_modules_arg)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+        return [x.strip() for x in target_modules_arg.split(",") if x.strip()]
+    return []
+
+
+def _safe_seq_id(record, idx):
+    rid = record.get("id")
+    if rid is None or str(rid).strip() == "":
+        rid = f"sample_{idx:06d}"
+    return str(rid)
+
+
+def _coords_to_contact_map(coords, threshold=8.0):
+    arr = np.asarray(coords)
+    if arr.ndim == 2 and arr.shape[1] == 3:
+        cb = arr
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        if arr.shape[1] > 4:
+            cb = arr[:, 4, :]  # 常见原子顺序下 Cβ 在索引 4
+        else:
+            cb = arr[:, 1, :]  # 回退：取 Cα
+    else:
+        raise ValueError(f"Unsupported coords shape: {arr.shape}")
+    d = cb[:, None, :] - cb[None, :, :]
+    dist = np.linalg.norm(d, axis=-1)
+    return (dist < float(threshold)).astype(np.uint8)
+
+
+def _normalize_record(record, idx, source):
+    seq = record.get("sequence", record.get("seq"))
+    if isinstance(seq, bytes):
+        seq = seq.decode("utf-8")
+    if seq is None:
+        raise ValueError("missing sequence")
+    seq = str(seq).strip()
+    if len(seq) == 0:
+        raise ValueError("empty sequence")
+
+    contact = record.get("contact_map", record.get("contacts"))
+    if contact is None and "coords" in record:
+        contact = _coords_to_contact_map(record["coords"])
+    if contact is None and "atom_positions" in record:
+        contact = _coords_to_contact_map(record["atom_positions"])
+    if contact is None:
+        raise ValueError("missing contact_map/coords")
+
+    cm = np.asarray(contact)
+    if cm.ndim != 2:
+        raise ValueError(f"contact_map must be 2D, got {cm.shape}")
+    L = len(seq)
+    if cm.shape[0] != L or cm.shape[1] != L:
+        raise ValueError(f"shape mismatch seq={L}, contact={cm.shape}")
+
+    out = {
+        "id": _safe_seq_id(record, idx),
+        "sequence": seq,
+        "contact_map": (cm > 0).astype(np.uint8),
+        "length": L,
+        "source": source,
+    }
+    return out
+
+
+def load_structure_records(data_path, data_format="auto", max_records=None):
+    data_path = Path(data_path).expanduser().resolve()
+    if not data_path.exists():
+        raise FileNotFoundError(f"DATA_PATH not found: {data_path}")
+
+    records = []
+    dropped = []
+
+    def _accept(rec, idx, source):
+        try:
+            norm = _normalize_record(rec, idx, source)
+            records.append(norm)
+        except Exception as e:
+            dropped.append({"index": int(idx), "source": source, "reason": str(e)})
+
+    if data_format in ("auto", "npz"):
+        files = [data_path] if data_path.suffix == ".npz" else sorted(data_path.glob("*.npz"))
+        for fp in files:
+            arr = np.load(fp, allow_pickle=True)
+            keys = list(arr.keys())
+            if "records" in arr:
+                items = arr["records"]
+                for i, item in enumerate(items):
+                    if max_records and len(records) >= max_records:
+                        break
+                    _accept(dict(item), i, str(fp))
+            elif {"sequence", "contact_map"}.issubset(keys):
+                seqs = arr["sequence"]
+                cms = arr["contact_map"]
+                if np.asarray(seqs).ndim == 0 and np.asarray(cms).ndim == 2:
+                    _accept({"sequence": seqs.item(), "contact_map": cms}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(cms))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"sequence": seqs[i], "contact_map": cms[i]}, i, str(fp))
+            elif {"seq", "contact_map"}.issubset(keys):
+                seqs = arr["seq"]
+                cms = arr["contact_map"]
+                if np.asarray(seqs).ndim == 0 and np.asarray(cms).ndim == 2:
+                    _accept({"seq": seqs.item(), "contact_map": cms}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(cms))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"seq": seqs[i], "contact_map": cms[i]}, i, str(fp))
+            elif {"sequence", "coords"}.issubset(keys):
+                seqs = arr["sequence"]
+                cds = arr["coords"]
+                if np.asarray(seqs).ndim == 0 and np.asarray(cds).ndim == 2:
+                    _accept({"sequence": seqs.item(), "coords": cds}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(cds))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"sequence": seqs[i], "coords": cds[i]}, i, str(fp))
+            elif "sequence" in keys and "atom_positions" in keys:
+                seqs = arr["sequence"]
+                aps = arr["atom_positions"]
+                if np.asarray(seqs).ndim == 0 and np.asarray(aps).ndim >= 2:
+                    _accept({"sequence": seqs.item(), "atom_positions": aps}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(aps))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"sequence": seqs[i], "atom_positions": aps[i]}, i, str(fp))
+            else:
+                dropped.append({"index": -1, "source": str(fp), "reason": f"unsupported keys: {keys}"})
+
+    if (data_format in ("auto", "sidechainnet")) and len(records) == 0:
+        try:
+            import sidechainnet as scn
+
+            dset = scn.load(casp_version=12, thinning=100)
+            for split_name in ("train", "valid", "test"):
+                split = dset.get(split_name, {})
+                seqs = split.get("seq", [])
+                coords = split.get("crd", [])
+                ids = split.get("ids", [])
+                for i in range(min(len(seqs), len(coords))):
+                    if max_records and len(records) >= max_records:
+                        break
+                    _accept(
+                        {
+                            "id": ids[i] if i < len(ids) else f"{split_name}_{i}",
+                            "seq": seqs[i],
+                            "coords": np.asarray(coords[i]).reshape(-1, 14, 3)[:, 4, :],
+                        },
+                        i,
+                        f"sidechainnet:{split_name}",
+                    )
+        except Exception as e:
+            dropped.append({"index": -1, "source": "sidechainnet", "reason": str(e)})
+
+    return records, dropped
+
+
+def write_dropped_records(dropped, out_csv):
+    if not dropped:
+        return
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["index", "source", "reason"])
+        writer.writeheader()
+        for row in dropped:
+            writer.writerow(row)
+
+
+def _length_bin(L):
+    if L < 256:
+        return "<256"
+    if L <= 512:
+        return "256-512"
+    return ">512"
+
+
+def _stratified_sample_indices(records, n_samples, seed=42):
+    if n_samples > len(records):
+        raise ValueError(f"Requested {n_samples} > available {len(records)}")
+    by_bin = {"<256": [], "256-512": [], ">512": []}
+    for i, rec in enumerate(records):
+        by_bin[_length_bin(rec["length"])].append(i)
+    rng = np.random.RandomState(seed)
+    target = {}
+    for k in by_bin.keys():
+        prop = len(by_bin[k]) / max(1, len(records))
+        target[k] = int(round(prop * n_samples))
+    # 修正四舍五入误差
+    while sum(target.values()) < n_samples:
+        k = max(by_bin.keys(), key=lambda x: len(by_bin[x]) - target[x])
+        target[k] += 1
+    while sum(target.values()) > n_samples:
+        k = max(target.keys(), key=lambda x: target[x])
+        if target[k] > 0:
+            target[k] -= 1
+    picked = []
+    for k, ids in by_bin.items():
+        take = min(target[k], len(ids))
+        if take > 0:
+            choice = rng.choice(ids, size=take, replace=False).tolist()
+            picked.extend(choice)
+    if len(picked) < n_samples:
+        remaining = sorted(list(set(range(len(records))) - set(picked)))
+        extra = rng.choice(remaining, size=(n_samples - len(picked)), replace=False).tolist()
+        picked.extend(extra)
+    return sorted(picked)
+
+
+def _split_structure_records(records, split_manifest_path, train_n=12000, test_n=2300, seed=42):
+    split_manifest_path = Path(split_manifest_path)
+    if split_manifest_path.exists():
+        with split_manifest_path.open("r", encoding="utf-8") as f:
+            man = json.load(f)
+        rid_to_idx = {r["id"]: i for i, r in enumerate(records)}
+        train_idx = [rid_to_idx[x] for x in man["train_ids"] if x in rid_to_idx]
+        test_idx = [rid_to_idx[x] for x in man["test_ids"] if x in rid_to_idx]
+        val_idx = [rid_to_idx[x] for x in man["val_ids"] if x in rid_to_idx]
+        return train_idx, test_idx, val_idx
+
+    if len(records) < (train_n + test_n):
+        raise RuntimeError(f"Not enough valid records ({len(records)}) for train={train_n}, test={test_n}")
+
+    by_bin = {"<256": [], "256-512": [], ">512": []}
+    for i, rec in enumerate(records):
+        by_bin[_length_bin(rec["length"])].append(i)
+    rng = np.random.RandomState(seed)
+    for k in by_bin:
+        rng.shuffle(by_bin[k])
+
+    train_idx, test_idx, val_idx = [], [], []
+    for k, ids in by_bin.items():
+        total = len(ids)
+        t = int(round(total * (train_n / len(records))))
+        te = int(round(total * (test_n / len(records))))
+        train_idx.extend(ids[:t])
+        test_idx.extend(ids[t:t + te])
+        val_idx.extend(ids[t + te:])
+
+    # 调整到精确条数
+    def _rebalance(target_n, bucket, pool):
+        while len(bucket) < target_n and pool:
+            bucket.append(pool.pop())
+        while len(bucket) > target_n:
+            pool.append(bucket.pop())
+
+    _rebalance(train_n, train_idx, val_idx)
+    _rebalance(test_n, test_idx, val_idx)
+
+    train_idx = sorted(set(train_idx))
+    test_idx = sorted(set(test_idx) - set(train_idx))
+    val_idx = sorted(set(val_idx) - set(train_idx) - set(test_idx))
+
+    # 兜底：若因去重产生缺口，再从 val 补齐
+    rng.shuffle(val_idx)
+    while len(train_idx) < train_n and val_idx:
+        train_idx.append(val_idx.pop())
+    while len(test_idx) < test_n and val_idx:
+        test_idx.append(val_idx.pop())
+
+    train_idx = sorted(train_idx[:train_n])
+    test_idx = sorted(test_idx[:test_n])
+    val_idx = sorted(set(range(len(records))) - set(train_idx) - set(test_idx))
+
+    split_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "seed": seed,
+        "train_ids": [records[i]["id"] for i in train_idx],
+        "test_ids": [records[i]["id"] for i in test_idx],
+        "val_ids": [records[i]["id"] for i in val_idx],
+    }
+    with split_manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return train_idx, test_idx, val_idx
+
+
+def _make_masked_batch(tokens, alphabet, mask_prob=0.15):
+    labels = tokens.clone()
+    special = torch.zeros_like(tokens, dtype=torch.bool)
+    for idx in [alphabet.padding_idx, alphabet.cls_idx, alphabet.eos_idx]:
+        special |= tokens.eq(idx)
+    can_mask = ~special
+    rand = torch.rand_like(tokens.float())
+    mask_pos = (rand < mask_prob) & can_mask
+    labels[~mask_pos] = -100
+    inputs = tokens.clone()
+    inputs[mask_pos] = alphabet.mask_idx
+    return inputs, labels
+
+
+@torch.no_grad()
+def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=2, mask_prob=0.15, max_eval=512):
+    if len(records) == 0:
+        return float("nan")
+    model.eval()
+    device = next(model.parameters()).device
+    loss_sum, steps = 0.0, 0
+    use = records[:min(max_eval, len(records))]
+    for i in range(0, len(use), batch_size):
+        chunk = use[i:i + batch_size]
+        batch = [(r["id"], r["sequence"]) for r in chunk]
+        _, _, toks = batch_converter(batch)
+        toks = toks.to(device)
+        inp, labels = _make_masked_batch(toks, alphabet, mask_prob=mask_prob)
+        out = model(inp, labels=labels)
+        loss_sum += float(out["loss"].item())
+        steps += 1
+    if steps == 0:
+        return float("nan")
+    return float(math.exp(loss_sum / steps))
+
+
+@torch.no_grad()
+def eval_long_range_pl(model, records, alphabet, batch_converter, batch_size=1, long_range_sep=24, max_eval=None):
+    if len(records) == 0:
+        return float("nan"), []
+    model.eval()
+    device = next(model.parameters()).device
+    use = records if max_eval is None else records[:min(max_eval, len(records))]
+    per_item = []
+    for i in range(0, len(use), batch_size):
+        chunk = use[i:i + batch_size]
+        batch = [(r["id"], r["sequence"]) for r in chunk]
+        _, _, toks = batch_converter(batch)
+        toks = toks.to(device)
+        out = model(toks, return_contacts=True)
+        contacts = out["contacts"].detach().cpu().numpy()  # [B, L, L]
+        for b, rec in enumerate(chunk):
+            pred = contacts[b]
+            L = rec["length"]
+            pred = pred[:L, :L]
+            gt = rec["contact_map"][:L, :L].astype(bool)
+            ii, jj = np.triu_indices(L, k=1)
+            long_mask = (jj - ii) >= long_range_sep
+            ii = ii[long_mask]
+            jj = jj[long_mask]
+            if len(ii) == 0:
+                per = float("nan")
+            else:
+                scores = pred[ii, jj]
+                labels = gt[ii, jj]
+                topk = min(L, len(scores))
+                if topk <= 0:
+                    per = float("nan")
+                else:
+                    top_idx = np.argpartition(-scores, topk - 1)[:topk]
+                    per = float(labels[top_idx].mean())
+            per_item.append({"id": rec["id"], "long_range_pl": per, "length": L})
+    vals = [x["long_range_pl"] for x in per_item if not np.isnan(x["long_range_pl"])]
+    return (float(np.mean(vals)) if vals else float("nan")), per_item
+
+
+def train_lora_esm(model, alphabet, batch_converter, train_records, val_records, cfg: FTConfig, args):
+    device = next(model.parameters()).device
+    model.train()
+    has_lora = freeze_base_params(model)
+    if not has_lora:
+        return {"train_loss_traj": [], "steps_done": 0, "eval_ppl_per_step": []}
+    lora_params = [p for _, p in model.named_parameters() if p.requires_grad]
+    if len(lora_params) == 0:
+        return {"train_loss_traj": [], "steps_done": 0, "eval_ppl_per_step": []}
+
+    from transformers import get_linear_schedule_with_warmup
+    opt = AdamW(lora_params, lr=cfg.lr)
+    sch = get_linear_schedule_with_warmup(
+        opt,
+        num_warmup_steps=int(cfg.warmup_ratio * cfg.steps),
+        num_training_steps=cfg.steps,
+    )
+    rng = np.random.RandomState(42)
+    hist, hist_ppl = [], []
+    best = float("inf")
+    no_improve = 0
+    for step in range(1, cfg.steps + 1):
+        total = 0.0
+        for _ in range(cfg.grad_accum):
+            idx = rng.choice(len(train_records), size=cfg.batch_size, replace=(len(train_records) < cfg.batch_size))
+            batch = [(train_records[i]["id"], train_records[i]["sequence"]) for i in idx]
+            _, _, toks = batch_converter(batch)
+            toks = toks.to(device)
+            inp, labels = _make_masked_batch(toks, alphabet, mask_prob=args.esm_mask_prob)
+            out = model(inp, labels=labels)
+            loss = out["loss"] / cfg.grad_accum
+            loss.backward()
+            total += float(loss.item())
+        if cfg.clip_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(lora_params, cfg.clip_grad_norm)
+        opt.step()
+        sch.step()
+        model.zero_grad(set_to_none=True)
+        hist.append(total)
+        if best - total > cfg.early_stop_delta:
+            best = total
+            no_improve = 0
+        else:
+            no_improve += 1
+        if step % max(1, cfg.eval_every) == 0:
+            ppl = eval_esm_pseudo_ppl(
+                model,
+                val_records,
+                alphabet,
+                batch_converter,
+                batch_size=max(1, args.bs),
+                mask_prob=args.esm_mask_prob,
+                max_eval=args.esm_eval_max_items,
+            )
+            hist_ppl.append(float(ppl))
+            print(f"[ESM-FT] step {step}/{cfg.steps} | train_loss={total:.4f} | eval_pPPL={ppl:.4f}")
+        if no_improve >= cfg.early_stop_patience:
+            print(f"[ESM-FT early-stop] no improvement {no_improve} steps")
+            break
+    return {"train_loss_traj": hist, "steps_done": len(hist), "eval_ppl_per_step": hist_ppl}
+
+
+def _load_esm_model(args):
+    model_name = args.esm_model_name
+    local_pt = Path(args.esm_local_model_pt).expanduser()
+    if local_pt.exists():
+        model, alphabet = esm.pretrained.load_model_and_alphabet_local(str(local_pt))
+    else:
+        model, alphabet = esm.pretrained.load_model_and_alphabet(model_name)
+    model = model.cuda() if torch.cuda.is_available() else model
+    batch_converter = alphabet.get_batch_converter()
+    return model, alphabet, batch_converter
+
+
+def _build_or_load_fixed_subset(test_records, out_dir, subset_n=500, seed=42):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = out_dir / "fixed_subset_500.json"
+    if manifest.exists():
+        with manifest.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        wanted = set(payload.get("ids", []))
+        subset = [r for r in test_records if r["id"] in wanted]
+        if len(subset) == len(wanted):
+            return subset, manifest
+    idx = _stratified_sample_indices(test_records, subset_n, seed=seed)
+    subset = [test_records[i] for i in idx]
+    payload = {"seed": seed, "ids": [x["id"] for x in subset], "size": len(subset)}
+    with manifest.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return subset, manifest
+
+
+def run_job_esm(job, out_dir, args):
+    os.makedirs(out_dir, exist_ok=True)
+
+    records, dropped = load_structure_records(
+        data_path=args.esm_data_path,
+        data_format=args.esm_data_format,
+        max_records=args.esm_max_records if args.esm_max_records > 0 else None,
+    )
+    write_dropped_records(dropped, Path(out_dir) / "dropped_samples.csv")
+
+    split_manifest = Path(out_dir) / "split_manifest.json"
+    train_idx, test_idx, val_idx = _split_structure_records(
+        records,
+        split_manifest_path=split_manifest,
+        train_n=args.esm_train_size,
+        test_n=args.esm_test_size,
+        seed=args.esm_split_seed,
+    )
+    train_records = [records[i] for i in train_idx]
+    test_records = [records[i] for i in test_idx]
+    val_records = [records[i] for i in val_idx]
+
+    model, alphabet, batch_converter = _load_esm_model(args)
+
+    target_modules = job.get("target_modules", args.esm_target_modules)
+    target_modules = parse_target_modules(target_modules)
+    rank = int(job.get("rank", job.get("r", args.esm_rank)))
+    seed = int(job.get("seed", args.SEED))
+    set_all_seeds(seed)
+
+    model = build_peft(model, target_modules=target_modules, r=rank)
+
+    ppl_base = eval_esm_pseudo_ppl(
+        model, test_records, alphabet, batch_converter,
+        batch_size=max(1, args.bs), mask_prob=args.esm_mask_prob, max_eval=args.esm_eval_max_items,
+    )
+    pl_full_base, per_full_base = eval_long_range_pl(
+        model, test_records, alphabet, batch_converter, batch_size=args.esm_contact_batch_size
+    )
+
+    fixed_subset, subset_manifest = _build_or_load_fixed_subset(
+        test_records, out_dir=Path(out_dir), subset_n=args.esm_fixed_subset_size, seed=args.esm_split_seed
+    )
+    pl_fixed_base, _ = eval_long_range_pl(
+        model, fixed_subset, alphabet, batch_converter, batch_size=args.esm_contact_batch_size
+    )
+
+    ft1 = FTConfig(
+        steps=args.s1_steps, lr=args.s1_lr, seq_len=args.seq_len, batch_size=args.bs,
+        grad_accum=args.ga, eval_every=args.eval_every, early_stop_patience=args.es_patience, early_stop_delta=args.es_delta
+    )
+    ft1_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft1, args)
+
+    ppl_s1 = eval_esm_pseudo_ppl(
+        model, test_records, alphabet, batch_converter,
+        batch_size=max(1, args.bs), mask_prob=args.esm_mask_prob, max_eval=args.esm_eval_max_items,
+    )
+    pl_full_s1, per_full_s1 = eval_long_range_pl(
+        model, test_records, alphabet, batch_converter, batch_size=args.esm_contact_batch_size
+    )
+    pl_fixed_s1, _ = eval_long_range_pl(
+        model, fixed_subset, alphabet, batch_converter, batch_size=args.esm_contact_batch_size
+    )
+
+    go_s2 = (ppl_base - ppl_s1) >= args.s2_gate_delta if args.s2_gate_delta is not None else True
+    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_ppl_per_step": []}
+    ppl_s2, pl_full_s2, pl_fixed_s2 = ppl_s1, pl_full_s1, pl_fixed_s1
+    per_full_s2 = per_full_s1
+    if go_s2 and args.s2_steps > 0:
+        ft2 = FTConfig(
+            steps=args.s2_steps, lr=args.s2_lr, seq_len=args.seq_len, batch_size=args.bs,
+            grad_accum=args.ga, eval_every=args.eval_every, early_stop_patience=args.es_patience, early_stop_delta=args.es_delta
+        )
+        ft2_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft2, args)
+        ppl_s2 = eval_esm_pseudo_ppl(
+            model, test_records, alphabet, batch_converter,
+            batch_size=max(1, args.bs), mask_prob=args.esm_mask_prob, max_eval=args.esm_eval_max_items,
+        )
+        pl_full_s2, per_full_s2 = eval_long_range_pl(
+            model, test_records, alphabet, batch_converter, batch_size=args.esm_contact_batch_size
+        )
+        pl_fixed_s2, _ = eval_long_range_pl(
+            model, fixed_subset, alphabet, batch_converter, batch_size=args.esm_contact_batch_size
+        )
+
+    rec = {
+        **job,
+        "mode": "esm",
+        "seed": seed,
+        "target_modules": target_modules,
+        "rank": rank,
+        "dataset": {
+            "data_path": str(args.esm_data_path),
+            "train_size": len(train_records),
+            "test_size": len(test_records),
+            "val_size": len(val_records),
+            "split_manifest": str(split_manifest),
+            "fixed_subset_manifest": str(subset_manifest),
+        },
+        "ppl_base": ppl_base,
+        "ppl_s1": ppl_s1,
+        "ppl_s2": ppl_s2,
+        "delta_ppl_s1": ppl_s1 - ppl_base,
+        "delta_ppl_s2": ppl_s2 - ppl_base,
+        "long_range_pl": {
+            "full_test_base": pl_full_base,
+            "full_test_s1": pl_full_s1,
+            "full_test_s2": pl_full_s2,
+            "fixed_500_base": pl_fixed_base,
+            "fixed_500_s1": pl_fixed_s1,
+            "fixed_500_s2": pl_fixed_s2,
+            "delta_full_s2": pl_full_s2 - pl_full_base,
+            "delta_fixed_s2": pl_fixed_s2 - pl_fixed_base,
+        },
+        "s1_log": ft1_log,
+        "s2_log": ft2_log,
+        "lora_params": count_lora_params(model),
+        "tokens_trained": (ft1_log["steps_done"] + ft2_log["steps_done"]) * args.bs * args.ga,
+    }
+
+    fname = f"esm_single_seed{seed}_r{rank}.json"
+    if "name" in job:
+        safe_name = re.sub(r"[^a-zA-Z0-9_\\-]+", "_", str(job["name"]))
+        fname = f"{safe_name}_seed{seed}_r{rank}.json"
+    with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=2, ensure_ascii=False)
+
+    per_item_path = os.path.join(out_dir, fname.replace(".json", "_per_item_s2.csv"))
+    with open(per_item_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "long_range_pl", "length"])
+        writer.writeheader()
+        for row in per_full_s2:
+            writer.writerow(row)
+    rec["long_range_pl"]["full_test_s2_per_item_csv"] = per_item_path
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return rec
+
+
 # def extract_gsm_num(text):
 #     m = re.search(r"####\s*(\d+)", text)
 #     if not m: return None
@@ -933,6 +1535,8 @@ def eval_gsm8k_accuracy(model, tokenizer, data_root="./data/gsm8k/main",
 # -------------------------
 def run_job(job, base_model_id, out_dir, args):
     os.makedirs(out_dir, exist_ok=True)
+    if getattr(args, "model_family", "causal_lm") == "esm2":
+        return run_job_esm(job, out_dir, args)
 
     # === 加载模型/分词器（沿用你原脚本） ===
     cache_dir = os.environ.get("TRANSFORMERS_CACHE") or os.environ.get("HF_HOME")
@@ -1218,6 +1822,27 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-1.5B") # Qwen/Qwen2.5-1.5B / meta-llama/Llama-3.1-8B
     # ap.add_argument("--configs_path", type=str, required=True) # <---
     ap.add_argument("--out_dir", type=str, default="runs")
+    ap.add_argument("--model_family", type=str, default="causal_lm", choices=["causal_lm", "esm2"])
+
+    # ESM2 / offline protein settings
+    ap.add_argument("--esm_model_name", type=str, default="esm2_t36_3B_UR50D")
+    ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
+    ap.add_argument("--esm_data_path", type=str, default="./assets/data/tr_rosetta")
+    ap.add_argument("--esm_data_format", type=str, default="auto", choices=["auto", "npz", "sidechainnet"])
+    ap.add_argument("--esm_train_size", type=int, default=12000)
+    ap.add_argument("--esm_test_size", type=int, default=2300)
+    ap.add_argument("--esm_split_seed", type=int, default=42)
+    ap.add_argument("--esm_fixed_subset_size", type=int, default=500)
+    ap.add_argument("--esm_max_records", type=int, default=0, help="0=use all")
+    ap.add_argument("--esm_mask_prob", type=float, default=0.15)
+    ap.add_argument("--esm_eval_max_items", type=int, default=512)
+    ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument("--esm_rank", type=int, default=8)
+    ap.add_argument(
+        "--esm_target_modules",
+        type=str,
+        default='["attention.self.query","attention.self.key","attention.self.value","attention.output.dense","intermediate.dense","output.dense"]',
+    )
 
     # 设备/内存策略
     ap.add_argument("--force_cuda0", action="store_true", help="禁用 auto offload，强制整机放到 cuda:0（显存足够时使用）")
@@ -1383,6 +2008,27 @@ if __name__ == "__main__":
     ap.add_argument("--model_id", type=str, default="meta-llama/Llama-3.1-8B")
     ap.add_argument("--configs_path", type=str, required=True)
     ap.add_argument("--out_dir", type=str, default="runs")
+    ap.add_argument("--model_family", type=str, default="causal_lm", choices=["causal_lm", "esm2"])
+
+    # ESM2 / offline protein settings
+    ap.add_argument("--esm_model_name", type=str, default="esm2_t36_3B_UR50D")
+    ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
+    ap.add_argument("--esm_data_path", type=str, default="./assets/data/tr_rosetta")
+    ap.add_argument("--esm_data_format", type=str, default="auto", choices=["auto", "npz", "sidechainnet"])
+    ap.add_argument("--esm_train_size", type=int, default=12000)
+    ap.add_argument("--esm_test_size", type=int, default=2300)
+    ap.add_argument("--esm_split_seed", type=int, default=42)
+    ap.add_argument("--esm_fixed_subset_size", type=int, default=500)
+    ap.add_argument("--esm_max_records", type=int, default=0, help="0=use all")
+    ap.add_argument("--esm_mask_prob", type=float, default=0.15)
+    ap.add_argument("--esm_eval_max_items", type=int, default=512)
+    ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument("--esm_rank", type=int, default=8)
+    ap.add_argument(
+        "--esm_target_modules",
+        type=str,
+        default='["attention.self.query","attention.self.key","attention.self.value","attention.output.dense","intermediate.dense","output.dense"]',
+    )
 
     # 设备/内存策略
     ap.add_argument("--force_cuda0", action="store_true", help="禁用 auto offload，强制整机放到 cuda:0（显存足够时使用）")
