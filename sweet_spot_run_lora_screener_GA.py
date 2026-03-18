@@ -935,31 +935,43 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
             elif {"sequence", "contact_map"}.issubset(keys):
                 seqs = arr["sequence"]
                 cms = arr["contact_map"]
-                for i in range(min(len(seqs), len(cms))):
-                    if max_records and len(records) >= max_records:
-                        break
-                    _accept({"sequence": seqs[i], "contact_map": cms[i]}, i, str(fp))
+                if np.asarray(seqs).ndim == 0 and np.asarray(cms).ndim == 2:
+                    _accept({"sequence": seqs.item(), "contact_map": cms}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(cms))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"sequence": seqs[i], "contact_map": cms[i]}, i, str(fp))
             elif {"seq", "contact_map"}.issubset(keys):
                 seqs = arr["seq"]
                 cms = arr["contact_map"]
-                for i in range(min(len(seqs), len(cms))):
-                    if max_records and len(records) >= max_records:
-                        break
-                    _accept({"seq": seqs[i], "contact_map": cms[i]}, i, str(fp))
+                if np.asarray(seqs).ndim == 0 and np.asarray(cms).ndim == 2:
+                    _accept({"seq": seqs.item(), "contact_map": cms}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(cms))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"seq": seqs[i], "contact_map": cms[i]}, i, str(fp))
             elif {"sequence", "coords"}.issubset(keys):
                 seqs = arr["sequence"]
                 cds = arr["coords"]
-                for i in range(min(len(seqs), len(cds))):
-                    if max_records and len(records) >= max_records:
-                        break
-                    _accept({"sequence": seqs[i], "coords": cds[i]}, i, str(fp))
+                if np.asarray(seqs).ndim == 0 and np.asarray(cds).ndim == 2:
+                    _accept({"sequence": seqs.item(), "coords": cds}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(cds))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"sequence": seqs[i], "coords": cds[i]}, i, str(fp))
             elif "sequence" in keys and "atom_positions" in keys:
                 seqs = arr["sequence"]
                 aps = arr["atom_positions"]
-                for i in range(min(len(seqs), len(aps))):
-                    if max_records and len(records) >= max_records:
-                        break
-                    _accept({"sequence": seqs[i], "atom_positions": aps[i]}, i, str(fp))
+                if np.asarray(seqs).ndim == 0 and np.asarray(aps).ndim >= 2:
+                    _accept({"sequence": seqs.item(), "atom_positions": aps}, 0, str(fp))
+                else:
+                    for i in range(min(len(seqs), len(aps))):
+                        if max_records and len(records) >= max_records:
+                            break
+                        _accept({"sequence": seqs[i], "atom_positions": aps[i]}, i, str(fp))
             else:
                 dropped.append({"index": -1, "source": str(fp), "reason": f"unsupported keys: {keys}"})
 
