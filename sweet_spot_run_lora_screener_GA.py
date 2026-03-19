@@ -931,47 +931,77 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
                 for i, item in enumerate(items):
                     if max_records and len(records) >= max_records:
                         break
-                    _accept(dict(item), i, str(fp))
+                    rec = dict(item)
+                    rec.setdefault("id", f"{fp.stem}_{i}")
+                    _accept(rec, i, str(fp))
             elif {"sequence", "contact_map"}.issubset(keys):
                 seqs = arr["sequence"]
                 cms = arr["contact_map"]
+                ids = arr["id"] if "id" in keys else None
                 if np.asarray(seqs).ndim == 0 and np.asarray(cms).ndim == 2:
-                    _accept({"sequence": seqs.item(), "contact_map": cms}, 0, str(fp))
+                    rid = ids.item() if (ids is not None and np.asarray(ids).ndim == 0) else fp.stem
+                    _accept({"id": rid, "sequence": seqs.item(), "contact_map": cms}, 0, str(fp))
                 else:
                     for i in range(min(len(seqs), len(cms))):
                         if max_records and len(records) >= max_records:
                             break
-                        _accept({"sequence": seqs[i], "contact_map": cms[i]}, i, str(fp))
+                        rid = (
+                            ids[i]
+                            if (ids is not None and np.asarray(ids).ndim > 0 and len(ids) > i)
+                            else f"{fp.stem}_{i}"
+                        )
+                        _accept({"id": rid, "sequence": seqs[i], "contact_map": cms[i]}, i, str(fp))
             elif {"seq", "contact_map"}.issubset(keys):
                 seqs = arr["seq"]
                 cms = arr["contact_map"]
+                ids = arr["id"] if "id" in keys else None
                 if np.asarray(seqs).ndim == 0 and np.asarray(cms).ndim == 2:
-                    _accept({"seq": seqs.item(), "contact_map": cms}, 0, str(fp))
+                    rid = ids.item() if (ids is not None and np.asarray(ids).ndim == 0) else fp.stem
+                    _accept({"id": rid, "seq": seqs.item(), "contact_map": cms}, 0, str(fp))
                 else:
                     for i in range(min(len(seqs), len(cms))):
                         if max_records and len(records) >= max_records:
                             break
-                        _accept({"seq": seqs[i], "contact_map": cms[i]}, i, str(fp))
+                        rid = (
+                            ids[i]
+                            if (ids is not None and np.asarray(ids).ndim > 0 and len(ids) > i)
+                            else f"{fp.stem}_{i}"
+                        )
+                        _accept({"id": rid, "seq": seqs[i], "contact_map": cms[i]}, i, str(fp))
             elif {"sequence", "coords"}.issubset(keys):
                 seqs = arr["sequence"]
                 cds = arr["coords"]
+                ids = arr["id"] if "id" in keys else None
                 if np.asarray(seqs).ndim == 0 and np.asarray(cds).ndim == 2:
-                    _accept({"sequence": seqs.item(), "coords": cds}, 0, str(fp))
+                    rid = ids.item() if (ids is not None and np.asarray(ids).ndim == 0) else fp.stem
+                    _accept({"id": rid, "sequence": seqs.item(), "coords": cds}, 0, str(fp))
                 else:
                     for i in range(min(len(seqs), len(cds))):
                         if max_records and len(records) >= max_records:
                             break
-                        _accept({"sequence": seqs[i], "coords": cds[i]}, i, str(fp))
+                        rid = (
+                            ids[i]
+                            if (ids is not None and np.asarray(ids).ndim > 0 and len(ids) > i)
+                            else f"{fp.stem}_{i}"
+                        )
+                        _accept({"id": rid, "sequence": seqs[i], "coords": cds[i]}, i, str(fp))
             elif "sequence" in keys and "atom_positions" in keys:
                 seqs = arr["sequence"]
                 aps = arr["atom_positions"]
+                ids = arr["id"] if "id" in keys else None
                 if np.asarray(seqs).ndim == 0 and np.asarray(aps).ndim >= 2:
-                    _accept({"sequence": seqs.item(), "atom_positions": aps}, 0, str(fp))
+                    rid = ids.item() if (ids is not None and np.asarray(ids).ndim == 0) else fp.stem
+                    _accept({"id": rid, "sequence": seqs.item(), "atom_positions": aps}, 0, str(fp))
                 else:
                     for i in range(min(len(seqs), len(aps))):
                         if max_records and len(records) >= max_records:
                             break
-                        _accept({"sequence": seqs[i], "atom_positions": aps[i]}, i, str(fp))
+                        rid = (
+                            ids[i]
+                            if (ids is not None and np.asarray(ids).ndim > 0 and len(ids) > i)
+                            else f"{fp.stem}_{i}"
+                        )
+                        _accept({"id": rid, "sequence": seqs[i], "atom_positions": aps[i]}, i, str(fp))
             else:
                 dropped.append({"index": -1, "source": str(fp), "reason": f"unsupported keys: {keys}"})
 
@@ -999,6 +1029,20 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
                     )
         except Exception as e:
             dropped.append({"index": -1, "source": "sidechainnet", "reason": str(e)})
+
+    # 兜底：若仍有重复 ID，自动去重重命名，防止 split/fixed_subset 失真
+    seen = {}
+    dup_cnt = 0
+    for rec in records:
+        rid = rec["id"]
+        if rid not in seen:
+            seen[rid] = 0
+            continue
+        seen[rid] += 1
+        dup_cnt += 1
+        rec["id"] = f"{rid}__dup{seen[rid]:04d}"
+    if dup_cnt > 0:
+        print(f"[warn] deduplicated {dup_cnt} repeated record ids")
 
     return records, dropped
 
@@ -1064,7 +1108,19 @@ def _split_structure_records(records, split_manifest_path, train_n=12000, test_n
         train_idx = [rid_to_idx[x] for x in man["train_ids"] if x in rid_to_idx]
         test_idx = [rid_to_idx[x] for x in man["test_ids"] if x in rid_to_idx]
         val_idx = [rid_to_idx[x] for x in man["val_ids"] if x in rid_to_idx]
-        return train_idx, test_idx, val_idx
+        ok = (
+            len(train_idx) == train_n
+            and len(test_idx) == test_n
+            and len(set(train_idx).intersection(test_idx)) == 0
+            and len(set(train_idx).intersection(val_idx)) == 0
+            and len(set(test_idx).intersection(val_idx)) == 0
+        )
+        if ok:
+            return train_idx, test_idx, val_idx
+        print(
+            "[warn] Existing split_manifest is incompatible with current records "
+            f"(train={len(train_idx)}/{train_n}, test={len(test_idx)}/{test_n}). Regenerating..."
+        )
 
     if len(records) < (train_n + test_n):
         raise RuntimeError(f"Not enough valid records ({len(records)}) for train={train_n}, test={test_n}")
