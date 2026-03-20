@@ -257,6 +257,104 @@ def build_peft(model, target_modules, r):
     )
     return get_peft_model(model, lcfg)
 
+
+class NativeLoRALinear(nn.Module):
+    """原生 LoRA 线性层：保留 base Linear 前向，并叠加低秩增量。"""
+    def __init__(self, base_layer: nn.Linear, r: int, lora_alpha: int = None, lora_dropout: float = 0.0):
+        super().__init__()
+        if not isinstance(base_layer, nn.Linear):
+            raise TypeError(f"NativeLoRALinear only supports nn.Linear, got {type(base_layer)}")
+        if r <= 0:
+            raise ValueError(f"r must be > 0, got {r}")
+
+        self.base_layer = base_layer
+        self.r = int(r)
+        self.lora_alpha = int(lora_alpha if lora_alpha is not None else r)
+        self.scaling = self.lora_alpha / max(1, self.r)
+        self.lora_dropout = nn.Dropout(float(lora_dropout)) if lora_dropout and lora_dropout > 0 else nn.Identity()
+
+        in_features = base_layer.in_features
+        out_features = base_layer.out_features
+        param_device = base_layer.weight.device
+        param_dtype = base_layer.weight.dtype
+        self.lora_A = nn.Parameter(torch.empty(self.r, in_features, device=param_device, dtype=param_dtype))
+        self.lora_B = nn.Parameter(torch.empty(out_features, self.r, device=param_device, dtype=param_dtype))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        base_out = self.base_layer(x)
+        lora_out = F.linear(self.lora_dropout(x), self.lora_A)
+        lora_out = F.linear(lora_out, self.lora_B) * self.scaling
+        return base_out + lora_out
+
+
+def _module_name_matches(name, target_modules):
+    for t in target_modules:
+        if name == t or name.endswith(f".{t}"):
+            return True
+    return False
+
+
+def _normalize_esm_targets(target_modules):
+    alias = {
+        "attention.self.query": "q_proj",
+        "attention.self.key": "k_proj",
+        "attention.self.value": "v_proj",
+        "attention.output.dense": "out_proj",
+        "intermediate.dense": "fc1",
+        "output.dense": "fc2",
+    }
+    allow = {"q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"}
+    out = []
+    for t in target_modules:
+        key = str(t).strip()
+        if not key:
+            continue
+        key = alias.get(key, key)
+        leaf = key.split(".")[-1]
+        if leaf in allow:
+            out.append(key if "." in key else leaf)
+    return out
+
+
+def build_native_esm_lora(model, target_modules, r, lora_alpha=None, lora_dropout=0.0):
+    if r == 0:
+        return model, {"injected": 0, "matched": [], "missing": []}
+
+    targets = _normalize_esm_targets(target_modules)
+    if len(targets) == 0:
+        return model, {"injected": 0, "matched": [], "missing": list(target_modules)}
+
+    named = dict(model.named_modules())
+    matched = []
+    injected = 0
+
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if not _module_name_matches(name, targets):
+            continue
+        if isinstance(module, NativeLoRALinear):
+            continue
+        if "." not in name:
+            parent = model
+            child = name
+        else:
+            parent_name, child = name.rsplit(".", 1)
+            parent = named.get(parent_name)
+        if parent is None or not hasattr(parent, child):
+            continue
+        setattr(parent, child, NativeLoRALinear(module, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout))
+        matched.append(name)
+        injected += 1
+
+    missing = [t for t in targets if not any((m == t or m.endswith(f".{t}")) for m in matched)]
+    if missing:
+        print(f"[warn] ESM native LoRA targets missing: {missing}")
+    print(f"[info] ESM native LoRA injected linear layers: {injected}")
+    return model, {"injected": injected, "matched": matched, "missing": missing}
+
 class TinySeqDataset(Dataset):
     def __init__(self, tok, texts, seq_len=256, max_samples=16):
         ids = tok("\n\n".join(texts), return_tensors="pt")["input_ids"][0]
@@ -1493,7 +1591,16 @@ def run_job_esm(job, out_dir, args):
     seed = int(job.get("seed", args.SEED))
     set_all_seeds(seed)
 
-    model = build_peft(model, target_modules=target_modules, r=rank)
+    if rank > 0:
+        model, native_lora_meta = build_native_esm_lora(
+            model,
+            target_modules=target_modules,
+            r=rank,
+            lora_alpha=rank,
+            lora_dropout=0.05,
+        )
+    else:
+        native_lora_meta = {"injected": 0, "matched": [], "missing": []}
 
     # -------------------------
     # Fixed subset
@@ -1643,6 +1750,7 @@ def run_job_esm(job, out_dir, args):
         "seed": seed,
         "target_modules": target_modules,
         "rank": rank,
+        "native_lora": native_lora_meta,
         "dataset": {
             "data_path": str(args.esm_data_path),
             "train_size": len(train_records),
