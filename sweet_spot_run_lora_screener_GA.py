@@ -275,8 +275,10 @@ class NativeLoRALinear(nn.Module):
 
         in_features = base_layer.in_features
         out_features = base_layer.out_features
-        self.lora_A = nn.Parameter(torch.empty(self.r, in_features))
-        self.lora_B = nn.Parameter(torch.empty(out_features, self.r))
+        param_device = base_layer.weight.device
+        param_dtype = base_layer.weight.dtype
+        self.lora_A = nn.Parameter(torch.empty(self.r, in_features, device=param_device, dtype=param_dtype))
+        self.lora_B = nn.Parameter(torch.empty(out_features, self.r, device=param_device, dtype=param_dtype))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
