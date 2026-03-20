@@ -1561,6 +1561,30 @@ def _build_or_load_fixed_subset(test_records, out_dir, subset_n=500, seed=42):
     return subset, manifest
 
 
+def _parse_esm_eval_modes(mode_arg):
+    if mode_arg is None:
+        return {"ppl", "long_range"}
+    s = str(mode_arg).strip().lower()
+    if s in ("", "all"):
+        return {"ppl", "long_range"}
+    if s in ("none", "off", "skip"):
+        return set()
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    alias = {
+        "ppl": "ppl",
+        "pseudo_ppl": "ppl",
+        "eval_esm_pseudo_ppl": "ppl",
+        "long_range": "long_range",
+        "long_range_pl": "long_range",
+        "eval_long_range_pl": "long_range",
+    }
+    out = set()
+    for p in parts:
+        if p in alias:
+            out.add(alias[p])
+    return out
+
+
 def run_job_esm(job, out_dir, args):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1612,37 +1636,50 @@ def run_job_esm(job, out_dir, args):
         seed=args.esm_split_seed,
     )
 
+    eval_modes = _parse_esm_eval_modes(getattr(args, "esm_eval_modes", "ppl,long_range"))
+    do_ppl = "ppl" in eval_modes
+    do_long_range = "long_range" in eval_modes
+
     # -------------------------
     # Base eval
     # -------------------------
-    ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=max(1, args.bs),
-        mask_prob=args.esm_mask_prob,
-        max_eval=args.esm_eval_max_items,
-    )
-    clear_cuda("after ppl_base")
+    ppl_base = float("nan")
+    ppl_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
+    if do_ppl:
+        ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
+            model,
+            test_records,
+            alphabet,
+            batch_converter,
+            batch_size=max(1, args.bs),
+            mask_prob=args.esm_mask_prob,
+            max_eval=args.esm_eval_max_items,
+        )
+        clear_cuda("after ppl_base")
 
-    pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_full_base")
+    pl_full_base = float("nan")
+    per_full_base = []
+    pl_full_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
+    pl_fixed_base = float("nan")
+    pl_fixed_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
+    if do_long_range:
+        pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
+            model,
+            test_records,
+            alphabet,
+            batch_converter,
+            batch_size=args.esm_contact_batch_size,
+        )
+        clear_cuda("after pl_full_base")
 
-    pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
-        model,
-        fixed_subset,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_fixed_base")
+        pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
+            model,
+            fixed_subset,
+            alphabet,
+            batch_converter,
+            batch_size=args.esm_contact_batch_size,
+        )
+        clear_cuda("after pl_fixed_base")
 
     # -------------------------
     # Stage 1
@@ -1659,34 +1696,39 @@ def run_job_esm(job, out_dir, args):
     )
     ft1_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft1, args)
 
-    ppl_s1, ppl_s1_stats = eval_esm_pseudo_ppl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=max(1, args.bs),
-        mask_prob=args.esm_mask_prob,
-        max_eval=args.esm_eval_max_items,
-    )
-    clear_cuda("after ppl_s1")
+    ppl_s1, ppl_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
+    if do_ppl:
+        ppl_s1, ppl_s1_stats = eval_esm_pseudo_ppl(
+            model,
+            test_records,
+            alphabet,
+            batch_converter,
+            batch_size=max(1, args.bs),
+            mask_prob=args.esm_mask_prob,
+            max_eval=args.esm_eval_max_items,
+        )
+        clear_cuda("after ppl_s1")
 
-    pl_full_s1, per_full_s1, pl_full_s1_stats = eval_long_range_pl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_full_s1")
+    pl_full_s1, per_full_s1, pl_full_s1_stats = float("nan"), [], {"skipped": True, "reason": "esm_eval_modes"}
+    pl_fixed_s1, pl_fixed_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
+    if do_long_range:
+        pl_full_s1, per_full_s1, pl_full_s1_stats = eval_long_range_pl(
+            model,
+            test_records,
+            alphabet,
+            batch_converter,
+            batch_size=args.esm_contact_batch_size,
+        )
+        clear_cuda("after pl_full_s1")
 
-    pl_fixed_s1, _, pl_fixed_s1_stats = eval_long_range_pl(
-        model,
-        fixed_subset,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_fixed_s1")
+        pl_fixed_s1, _, pl_fixed_s1_stats = eval_long_range_pl(
+            model,
+            fixed_subset,
+            alphabet,
+            batch_converter,
+            batch_size=args.esm_contact_batch_size,
+        )
+        clear_cuda("after pl_fixed_s1")
 
     # -------------------------
     # Stage 2
@@ -1715,34 +1757,36 @@ def run_job_esm(job, out_dir, args):
         )
         ft2_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft2, args)
 
-        ppl_s2, ppl_s2_stats = eval_esm_pseudo_ppl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=max(1, args.bs),
-            mask_prob=args.esm_mask_prob,
-            max_eval=args.esm_eval_max_items,
-        )
-        clear_cuda("after ppl_s2")
+        if do_ppl:
+            ppl_s2, ppl_s2_stats = eval_esm_pseudo_ppl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=max(1, args.bs),
+                mask_prob=args.esm_mask_prob,
+                max_eval=args.esm_eval_max_items,
+            )
+            clear_cuda("after ppl_s2")
 
-        pl_full_s2, per_full_s2, pl_full_s2_stats = eval_long_range_pl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_full_s2")
+        if do_long_range:
+            pl_full_s2, per_full_s2, pl_full_s2_stats = eval_long_range_pl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_full_s2")
 
-        pl_fixed_s2, _, pl_fixed_s2_stats = eval_long_range_pl(
-            model,
-            fixed_subset,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_fixed_s2")
+            pl_fixed_s2, _, pl_fixed_s2_stats = eval_long_range_pl(
+                model,
+                fixed_subset,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_fixed_s2")
 
     rec = {
         **job,
@@ -1751,6 +1795,7 @@ def run_job_esm(job, out_dir, args):
         "target_modules": target_modules,
         "rank": rank,
         "native_lora": native_lora_meta,
+        "esm_eval_modes": sorted(list(eval_modes)),
         "dataset": {
             "data_path": str(args.esm_data_path),
             "train_size": len(train_records),
@@ -2221,6 +2266,12 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--esm_mask_prob", type=float, default=0.15)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument(
+        "--esm_eval_modes",
+        type=str,
+        default="ppl,long_range",
+        help="控制 ESM2 评测项：all/none 或逗号分隔 [ppl,long_range]",
+    )
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2434,6 +2485,12 @@ if __name__ == "__main__":
     ap.add_argument("--esm_mask_prob", type=float, default=0.15)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument(
+        "--esm_eval_modes",
+        type=str,
+        default="ppl,long_range",
+        help="控制 ESM2 评测项：all/none 或逗号分隔 [ppl,long_range]",
+    )
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
