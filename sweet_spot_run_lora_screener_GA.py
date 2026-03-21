@@ -318,7 +318,52 @@ def _normalize_esm_targets(target_modules):
     return out
 
 
-def build_native_esm_lora(model, target_modules, r, lora_alpha=None, lora_dropout=0.0):
+def _parse_layer_filter(layer_value=None, layers_value=None):
+    raw = []
+    if layer_value is not None:
+        raw.append(layer_value)
+    if layers_value is not None:
+        if isinstance(layers_value, (list, tuple)):
+            raw.extend(list(layers_value))
+        else:
+            raw.append(layers_value)
+    if len(raw) == 0:
+        return None
+
+    out = set()
+    for x in raw:
+        if isinstance(x, int):
+            out.add(int(x))
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        if s.lower() in ("all", "*", "none"):
+            return None
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list):
+                    for v in arr:
+                        out.add(int(v))
+                    continue
+            except Exception:
+                pass
+        for part in s.split(","):
+            part = part.strip()
+            if part:
+                out.add(int(part))
+    return sorted(out) if len(out) > 0 else None
+
+
+def _layer_match_from_module_name(module_name):
+    m = re.search(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)", module_name)
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
+def build_native_esm_lora(model, target_modules, r, lora_alpha=None, lora_dropout=0.0, layer_filter=None):
     if r == 0:
         return model, {"injected": 0, "matched": [], "missing": []}
 
@@ -333,6 +378,10 @@ def build_native_esm_lora(model, target_modules, r, lora_alpha=None, lora_dropou
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
+        if layer_filter is not None:
+            lid = _layer_match_from_module_name(name)
+            if lid is None or lid not in layer_filter:
+                continue
         if not _module_name_matches(name, targets):
             continue
         if isinstance(module, NativeLoRALinear):
@@ -353,7 +402,7 @@ def build_native_esm_lora(model, target_modules, r, lora_alpha=None, lora_dropou
     if missing:
         print(f"[warn] ESM native LoRA targets missing: {missing}")
     print(f"[info] ESM native LoRA injected linear layers: {injected}")
-    return model, {"injected": injected, "matched": matched, "missing": missing}
+    return model, {"injected": injected, "matched": matched, "missing": missing, "layers": layer_filter}
 
 class TinySeqDataset(Dataset):
     def __init__(self, tok, texts, seq_len=256, max_samples=16):
@@ -1612,6 +1661,7 @@ def run_job_esm(job, out_dir, args):
     target_modules = job.get("target_modules", args.esm_target_modules)
     target_modules = parse_target_modules(target_modules)
     rank = int(job.get("rank", job.get("r", args.esm_rank)))
+    layer_filter = _parse_layer_filter(job.get("layer", None), job.get("layers", None))
     seed = int(job.get("seed", args.SEED))
     set_all_seeds(seed)
 
@@ -1622,9 +1672,10 @@ def run_job_esm(job, out_dir, args):
             r=rank,
             lora_alpha=rank,
             lora_dropout=0.05,
+            layer_filter=layer_filter,
         )
     else:
-        native_lora_meta = {"injected": 0, "matched": [], "missing": []}
+        native_lora_meta = {"injected": 0, "matched": [], "missing": [], "layers": layer_filter}
 
     # -------------------------
     # Fixed subset
@@ -1794,6 +1845,7 @@ def run_job_esm(job, out_dir, args):
         "seed": seed,
         "target_modules": target_modules,
         "rank": rank,
+        "layer_filter": layer_filter,
         "native_lora": native_lora_meta,
         "esm_eval_modes": sorted(list(eval_modes)),
         "dataset": {
