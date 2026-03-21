@@ -1634,16 +1634,67 @@ def _parse_esm_eval_modes(mode_arg):
     return out
 
 
+def _read_esm_baseline_cache(cache_path):
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return {}
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_esm_baseline_cache(cache_path, payload):
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, eval_modes):
+    key_obj = {
+        "seed": int(seed),
+        "model_name": str(args.esm_model_name),
+        "local_model_pt": str(args.esm_local_model_pt),
+        "data_path": str(args.esm_data_path),
+        "data_format": str(args.esm_data_format),
+        "split_manifest": str(split_manifest),
+        "subset_manifest": str(subset_manifest),
+        "eval_modes": sorted(list(eval_modes)),
+        "esm_mask_prob": float(args.esm_mask_prob),
+        "esm_eval_max_items": int(args.esm_eval_max_items),
+        "esm_contact_batch_size": int(args.esm_contact_batch_size),
+        "bs": int(args.bs),
+    }
+    return json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+
+
+def _tlog_start(tag):
+    ts = time.time()
+    print(f"[time] start {tag}")
+    return ts
+
+
+def _tlog_end(tag, ts):
+    print(f"[time] done  {tag} | elapsed={time.time() - ts:.2f}s")
+
+
 def run_job_esm(job, out_dir, args):
+    t_job = _tlog_start("run_job_esm")
     os.makedirs(out_dir, exist_ok=True)
 
+    t_data = _tlog_start("load_structure_records")
     records, dropped = load_structure_records(
         data_path=args.esm_data_path,
         data_format=args.esm_data_format,
         max_records=args.esm_max_records if args.esm_max_records > 0 else None,
     )
     write_dropped_records(dropped, Path(out_dir) / "dropped_samples.csv")
+    _tlog_end("load_structure_records", t_data)
 
+    t_split = _tlog_start("split_records")
     split_manifest = Path(out_dir) / "split_manifest.json"
     train_idx, test_idx, val_idx = _split_structure_records(
         records,
@@ -1655,8 +1706,11 @@ def run_job_esm(job, out_dir, args):
     train_records = [records[i] for i in train_idx]
     test_records = [records[i] for i in test_idx]
     val_records = [records[i] for i in val_idx]
+    _tlog_end("split_records", t_split)
 
+    t_model = _tlog_start("load_esm_model")
     model, alphabet, batch_converter = _load_esm_model(args)
+    _tlog_end("load_esm_model", t_model)
 
     target_modules = job.get("target_modules", args.esm_target_modules)
     target_modules = parse_target_modules(target_modules)
@@ -1696,41 +1750,68 @@ def run_job_esm(job, out_dir, args):
     # -------------------------
     ppl_base = float("nan")
     ppl_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
-    if do_ppl:
-        ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=max(1, args.bs),
-            mask_prob=args.esm_mask_prob,
-            max_eval=args.esm_eval_max_items,
-        )
-        clear_cuda("after ppl_base")
-
     pl_full_base = float("nan")
     per_full_base = []
     pl_full_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
     pl_fixed_base = float("nan")
     pl_fixed_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
-    if do_long_range:
-        pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_full_base")
 
-        pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
-            model,
-            fixed_subset,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_fixed_base")
+    baseline_cache_path = Path(out_dir) / "esm_baseline_cache.json"
+    baseline_key = _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, eval_modes)
+    baseline_cache = _read_esm_baseline_cache(baseline_cache_path)
+    cached_base = baseline_cache.get(baseline_key) if rank > 0 else None
+
+    if cached_base is not None:
+        print("[info] using cached ESM baseline metrics")
+        ppl_base = float(cached_base.get("ppl_base", float("nan")))
+        ppl_base_stats = cached_base.get("ppl_base_stats", ppl_base_stats)
+        pl_full_base = float(cached_base.get("pl_full_base", float("nan")))
+        pl_full_base_stats = cached_base.get("pl_full_base_stats", pl_full_base_stats)
+        pl_fixed_base = float(cached_base.get("pl_fixed_base", float("nan")))
+        pl_fixed_base_stats = cached_base.get("pl_fixed_base_stats", pl_fixed_base_stats)
+    else:
+        t_base = _tlog_start("baseline_eval")
+        if do_ppl:
+            ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=max(1, args.bs),
+                mask_prob=args.esm_mask_prob,
+                max_eval=args.esm_eval_max_items,
+            )
+            clear_cuda("after ppl_base")
+
+        if do_long_range:
+            pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_full_base")
+
+            pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
+                model,
+                fixed_subset,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_fixed_base")
+        _tlog_end("baseline_eval", t_base)
+
+        baseline_cache[baseline_key] = {
+            "ppl_base": ppl_base,
+            "ppl_base_stats": ppl_base_stats,
+            "pl_full_base": pl_full_base,
+            "pl_full_base_stats": pl_full_base_stats,
+            "pl_fixed_base": pl_fixed_base,
+            "pl_fixed_base_stats": pl_fixed_base_stats,
+        }
+        _write_esm_baseline_cache(baseline_cache_path, baseline_cache)
 
     # -------------------------
     # Stage 1
@@ -1745,8 +1826,11 @@ def run_job_esm(job, out_dir, args):
         early_stop_patience=args.es_patience,
         early_stop_delta=args.es_delta,
     )
+    t_s1_train = _tlog_start("stage1_train")
     ft1_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft1, args)
+    _tlog_end("stage1_train", t_s1_train)
 
+    t_s1_eval = _tlog_start("stage1_eval")
     ppl_s1, ppl_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
     if do_ppl:
         ppl_s1, ppl_s1_stats = eval_esm_pseudo_ppl(
@@ -1780,6 +1864,7 @@ def run_job_esm(job, out_dir, args):
             batch_size=args.esm_contact_batch_size,
         )
         clear_cuda("after pl_fixed_s1")
+    _tlog_end("stage1_eval", t_s1_eval)
 
     # -------------------------
     # Stage 2
@@ -1796,6 +1881,7 @@ def run_job_esm(job, out_dir, args):
     pl_fixed_s2_stats = pl_fixed_s1_stats
 
     if go_s2 and args.s2_steps > 0:
+        t_s2_train = _tlog_start("stage2_train")
         ft2 = FTConfig(
             steps=args.s2_steps,
             lr=args.s2_lr,
@@ -1807,7 +1893,9 @@ def run_job_esm(job, out_dir, args):
             early_stop_delta=args.es_delta,
         )
         ft2_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft2, args)
+        _tlog_end("stage2_train", t_s2_train)
 
+        t_s2_eval = _tlog_start("stage2_eval")
         if do_ppl:
             ppl_s2, ppl_s2_stats = eval_esm_pseudo_ppl(
                 model,
@@ -1838,6 +1926,7 @@ def run_job_esm(job, out_dir, args):
                 batch_size=args.esm_contact_batch_size,
             )
             clear_cuda("after pl_fixed_s2")
+        _tlog_end("stage2_eval", t_s2_eval)
 
     rec = {
         **job,
@@ -1912,6 +2001,7 @@ def run_job_esm(job, out_dir, args):
 
     hard_free(model, alphabet, batch_converter, tag="run_job_esm end")
     model = alphabet = batch_converter = None
+    _tlog_end("run_job_esm", t_job)
     return rec
 
 # def extract_gsm_num(text):
