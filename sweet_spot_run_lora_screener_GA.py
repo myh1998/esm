@@ -1118,6 +1118,8 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
     if data_format in ("auto", "npz"):
         files = [data_path] if data_path.suffix == ".npz" else sorted(data_path.glob("*.npz"))
         for fp in files:
+            if max_records and len(records) >= max_records:
+                break
             arr = np.load(fp, allow_pickle=True)
             keys = list(arr.keys())
             if "records" in arr:
@@ -1205,6 +1207,8 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
 
             dset = scn.load(casp_version=12, thinning=100)
             for split_name in ("train", "valid", "test"):
+                if max_records and len(records) >= max_records:
+                    break
                 split = dset.get(split_name, {})
                 seqs = split.get("seq", [])
                 coords = split.get("crd", [])
