@@ -357,7 +357,7 @@ def _parse_layer_filter(layer_value=None, layers_value=None):
 
 
 def _layer_match_from_module_name(module_name):
-    m = re.search(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)", module_name)
+    m = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", module_name)
     if m is None:
         return None
     return int(m.group(1))
