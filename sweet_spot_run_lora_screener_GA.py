@@ -10,7 +10,7 @@ D) 可选 --force_cuda0 强制把模型放到 cuda:0，减少 offload（默认�
 E) PPL评估优化：确保模型在正确状态下评估，避免训练状态干扰
 """
 
-import os, json, time, math, argparse, gc, csv
+import os, json, time, math, argparse, gc, csv, sys
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -47,6 +47,11 @@ except Exception:
     HAS_HARNESS = False
 
 import contextlib
+# 在非交互环境（如 qsub + tee）中尽量实时刷新日志
+with contextlib.suppress(Exception):
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+with contextlib.suppress(Exception):
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
 # -------------------------
 # 基础加载
 # -------------------------
@@ -1596,9 +1601,9 @@ def train_lora_esm(model, alphabet, batch_converter, train_records, val_records,
                 mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
             )
             hist_ppl.append(float(ppl))
-            print(f"[ESM-FT] step {step}/{cfg.steps} | train_loss={total:.4f} | eval_pPPL={ppl:.4f}")
+            print(f"[ESM-FT] step {step}/{cfg.steps} | train_loss={total:.4f} | eval_pPPL={ppl:.4f}", flush=True)
         if no_improve >= cfg.early_stop_patience:
-            print(f"[ESM-FT early-stop] no improvement {no_improve} steps")
+            print(f"[ESM-FT early-stop] no improvement {no_improve} steps", flush=True)
             break
     return {"train_loss_traj": hist, "steps_done": len(hist), "eval_ppl_per_step": hist_ppl}
 
@@ -1613,6 +1618,34 @@ def _load_esm_model(args):
     model = model.cuda() if torch.cuda.is_available() else model
     batch_converter = alphabet.get_batch_converter()
     return model, alphabet, batch_converter
+
+
+def _apply_esm_30gb_profile(args):
+    """Apply safer defaults for ESM2 3B fine-tuning on ~30GB GPUs."""
+    if not bool(getattr(args, "esm_30gb_stable_profile", False)):
+        return args
+
+    # keep profile conservative to reduce OOM risk
+    args.seq_len = min(int(args.seq_len), 384)
+    args.bs = min(int(args.bs), 1)
+    args.ga = max(int(args.ga), 2)
+    args.esm_eval_modes = "ppl"
+    args.esm_eval_max_items = min(int(args.esm_eval_max_items), 256)
+    args.esm_contact_batch_size = 1
+    args.s1_lr = min(float(args.s1_lr), 5e-5)
+    args.s2_lr = min(float(args.s2_lr), 3e-5)
+    args.s1_warmup_ratio = max(float(args.s1_warmup_ratio), 0.10)
+    args.s2_warmup_ratio = max(float(args.s2_warmup_ratio), 0.10)
+
+    print(
+        "[info] esm_30gb_stable_profile applied: "
+        f"seq_len={args.seq_len}, bs={args.bs}, ga={args.ga}, "
+        f"s1_lr={args.s1_lr}, s2_lr={args.s2_lr}, "
+        f"s1_warmup={args.s1_warmup_ratio}, s2_warmup={args.s2_warmup_ratio}, "
+        f"esm_eval_modes={args.esm_eval_modes}, esm_eval_max_items={args.esm_eval_max_items}",
+        flush=True,
+    )
+    return args
 
 
 def _build_or_load_fixed_subset(test_records, out_dir, subset_n=500, seed=42):
@@ -1699,12 +1732,12 @@ def _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, ev
 
 def _tlog_start(tag):
     ts = time.time()
-    print(f"[time] start {tag}")
+    print(f"[time] start {tag}", flush=True)
     return ts
 
 
 def _tlog_end(tag, ts):
-    print(f"[time] done  {tag} | elapsed={time.time() - ts:.2f}s")
+    print(f"[time] done  {tag} | elapsed={time.time() - ts:.2f}s", flush=True)
 
 
 def run_job_esm(job, out_dir, args):
@@ -1847,6 +1880,7 @@ def run_job_esm(job, out_dir, args):
     ft1 = FTConfig(
         steps=args.s1_steps,
         lr=args.s1_lr,
+        warmup_ratio=args.s1_warmup_ratio,
         seq_len=args.seq_len,
         batch_size=args.bs,
         grad_accum=args.ga,
@@ -1915,6 +1949,7 @@ def run_job_esm(job, out_dir, args):
         ft2 = FTConfig(
             steps=args.s2_steps,
             lr=args.s2_lr,
+            warmup_ratio=args.s2_warmup_ratio,
             seq_len=args.seq_len,
             batch_size=args.bs,
             grad_accum=args.ga,
@@ -2702,10 +2737,12 @@ if __name__ == "__main__":
     # Stage 1
     ap.add_argument("--s1_steps", type=int, default=50)
     ap.add_argument("--s1_lr", type=float, default=1e-4)
+    ap.add_argument("--s1_warmup_ratio", type=float, default=0.10)
 
     # Stage 2
     ap.add_argument("--s2_steps", type=int, default=300)
     ap.add_argument("--s2_lr", type=float, default=8e-5)
+    ap.add_argument("--s2_warmup_ratio", type=float, default=0.10)
     ap.add_argument("--s2_gate_delta", type=float, default=-0.02, help="进入S2的门槛：ppl_base - ppl_s1 >= gate")
 
     # 训练 & 早停 & 批配置
@@ -2759,6 +2796,11 @@ if __name__ == "__main__":
     ap.add_argument("--harness_no_4bit", action="store_true",
                 help="评测时禁用 4bit 量化，与 eval_ppl 的精度一致")
     ap.add_argument("--fast_debug", action="store_true")
+    ap.add_argument(
+        "--esm_30gb_stable_profile",
+        action="store_true",
+        help="启用 30GB 显存稳定配置（更保守的 seq_len/lr/warmup/eval）",
+    )
 
     args = ap.parse_args()
 
@@ -2770,6 +2812,8 @@ if __name__ == "__main__":
         args.s1_steps = 0
         args.s2_steps = 0
         print("[info] fast_debug enabled: using reduced ESM eval sizes", flush=True)
+
+    args = _apply_esm_30gb_profile(args)
     
     if args.model_family == "esm2":
         global_task_type = TaskType.FEATURE_EXTRACTION
