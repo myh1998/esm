@@ -10,7 +10,7 @@ D) 可选 --force_cuda0 强制把模型放到 cuda:0，减少 offload（默认�
 E) PPL评估优化：确保模型在正确状态下评估，避免训练状态干扰
 """
 
-import os, json, time, math, argparse, gc, csv
+import os, json, time, math, argparse, gc, csv, sys
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -47,6 +47,11 @@ except Exception:
     HAS_HARNESS = False
 
 import contextlib
+# 在非交互环境（如 qsub + tee）中尽量实时刷新日志
+with contextlib.suppress(Exception):
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+with contextlib.suppress(Exception):
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
 # -------------------------
 # 基础加载
 # -------------------------
@@ -256,6 +261,153 @@ def build_peft(model, target_modules, r):
         target_modules=target_modules, task_type=global_task_type, bias="none"
     )
     return get_peft_model(model, lcfg)
+
+
+class NativeLoRALinear(nn.Module):
+    """原生 LoRA 线性层：保留 base Linear 前向，并叠加低秩增量。"""
+    def __init__(self, base_layer: nn.Linear, r: int, lora_alpha: int = None, lora_dropout: float = 0.0):
+        super().__init__()
+        if not isinstance(base_layer, nn.Linear):
+            raise TypeError(f"NativeLoRALinear only supports nn.Linear, got {type(base_layer)}")
+        if r <= 0:
+            raise ValueError(f"r must be > 0, got {r}")
+
+        self.base_layer = base_layer
+        self.r = int(r)
+        self.lora_alpha = int(lora_alpha if lora_alpha is not None else r)
+        self.scaling = self.lora_alpha / max(1, self.r)
+        self.lora_dropout = nn.Dropout(float(lora_dropout)) if lora_dropout and lora_dropout > 0 else nn.Identity()
+
+        in_features = base_layer.in_features
+        out_features = base_layer.out_features
+        param_device = base_layer.weight.device
+        param_dtype = base_layer.weight.dtype
+        self.lora_A = nn.Parameter(torch.empty(self.r, in_features, device=param_device, dtype=param_dtype))
+        self.lora_B = nn.Parameter(torch.empty(out_features, self.r, device=param_device, dtype=param_dtype))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        base_out = self.base_layer(x)
+        lora_out = F.linear(self.lora_dropout(x), self.lora_A)
+        lora_out = F.linear(lora_out, self.lora_B) * self.scaling
+        return base_out + lora_out
+
+
+def _module_name_matches(name, target_modules):
+    for t in target_modules:
+        if name == t or name.endswith(f".{t}"):
+            return True
+    return False
+
+
+def _normalize_esm_targets(target_modules):
+    alias = {
+        "attention.self.query": "q_proj",
+        "attention.self.key": "k_proj",
+        "attention.self.value": "v_proj",
+        "attention.output.dense": "out_proj",
+        "intermediate.dense": "fc1",
+        "output.dense": "fc2",
+    }
+    allow = {"q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"}
+    out = []
+    for t in target_modules:
+        key = str(t).strip()
+        if not key:
+            continue
+        key = alias.get(key, key)
+        leaf = key.split(".")[-1]
+        if leaf in allow:
+            out.append(key if "." in key else leaf)
+    return out
+
+
+def _parse_layer_filter(layer_value=None, layers_value=None):
+    raw = []
+    if layer_value is not None:
+        raw.append(layer_value)
+    if layers_value is not None:
+        if isinstance(layers_value, (list, tuple)):
+            raw.extend(list(layers_value))
+        else:
+            raw.append(layers_value)
+    if len(raw) == 0:
+        return None
+
+    out = set()
+    for x in raw:
+        if isinstance(x, int):
+            out.add(int(x))
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        if s.lower() in ("all", "*", "none"):
+            return None
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list):
+                    for v in arr:
+                        out.add(int(v))
+                    continue
+            except Exception:
+                pass
+        for part in s.split(","):
+            part = part.strip()
+            if part:
+                out.add(int(part))
+    return sorted(out) if len(out) > 0 else None
+
+
+def _layer_match_from_module_name(module_name):
+    m = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", module_name)
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
+def build_native_esm_lora(model, target_modules, r, lora_alpha=None, lora_dropout=0.0, layer_filter=None):
+    if r == 0:
+        return model, {"injected": 0, "matched": [], "missing": []}
+
+    targets = _normalize_esm_targets(target_modules)
+    if len(targets) == 0:
+        return model, {"injected": 0, "matched": [], "missing": list(target_modules)}
+
+    named = dict(model.named_modules())
+    matched = []
+    injected = 0
+
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if layer_filter is not None:
+            lid = _layer_match_from_module_name(name)
+            if lid is None or lid not in layer_filter:
+                continue
+        if not _module_name_matches(name, targets):
+            continue
+        if isinstance(module, NativeLoRALinear):
+            continue
+        if "." not in name:
+            parent = model
+            child = name
+        else:
+            parent_name, child = name.rsplit(".", 1)
+            parent = named.get(parent_name)
+        if parent is None or not hasattr(parent, child):
+            continue
+        setattr(parent, child, NativeLoRALinear(module, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout))
+        matched.append(name)
+        injected += 1
+
+    missing = [t for t in targets if not any((m == t or m.endswith(f".{t}")) for m in matched)]
+    if missing:
+        print(f"[warn] ESM native LoRA targets missing: {missing}")
+    print(f"[info] ESM native LoRA injected linear layers: {injected}")
+    return model, {"injected": injected, "matched": matched, "missing": missing, "layers": layer_filter}
 
 class TinySeqDataset(Dataset):
     def __init__(self, tok, texts, seq_len=256, max_samples=16):
@@ -971,6 +1123,8 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
     if data_format in ("auto", "npz"):
         files = [data_path] if data_path.suffix == ".npz" else sorted(data_path.glob("*.npz"))
         for fp in files:
+            if max_records and len(records) >= max_records:
+                break
             arr = np.load(fp, allow_pickle=True)
             keys = list(arr.keys())
             if "records" in arr:
@@ -1058,6 +1212,8 @@ def load_structure_records(data_path, data_format="auto", max_records=None):
 
             dset = scn.load(casp_version=12, thinning=100)
             for split_name in ("train", "valid", "test"):
+                if max_records and len(records) >= max_records:
+                    break
                 split = dset.get(split_name, {})
                 seqs = split.get("seq", [])
                 coords = split.get("crd", [])
@@ -1225,13 +1381,16 @@ def _split_structure_records(records, split_manifest_path, train_n=12000, test_n
     return train_idx, test_idx, val_idx
 
 
-def _make_masked_batch(tokens, alphabet, mask_prob=0.15):
+def _make_masked_batch(tokens, alphabet, mask_prob=0.15, rng=None):
     labels = tokens.clone()
     special = torch.zeros_like(tokens, dtype=torch.bool)
     for idx in [alphabet.padding_idx, alphabet.cls_idx, alphabet.eos_idx]:
         special |= tokens.eq(idx)
     can_mask = ~special
-    rand = torch.rand_like(tokens.float())
+    if rng is None:
+        rand = torch.rand_like(tokens.float())
+    else:
+        rand = torch.rand(tokens.shape, device=tokens.device, dtype=torch.float32, generator=rng)
     mask_pos = (rand < mask_prob) & can_mask
     labels[~mask_pos] = -100
     inputs = tokens.clone()
@@ -1240,7 +1399,18 @@ def _make_masked_batch(tokens, alphabet, mask_prob=0.15):
 
 
 @torch.no_grad()
-def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=1, mask_prob=0.15, max_eval=512, max_len=768):
+def eval_esm_pseudo_ppl(
+    model,
+    records,
+    alphabet,
+    batch_converter,
+    batch_size=1,
+    mask_prob=0.15,
+    max_eval=512,
+    max_len=768,
+    deterministic_mask=False,
+    mask_seed=42,
+):
     
     stats = {
     "total_seen": 0,
@@ -1255,6 +1425,10 @@ def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=1,
 
     model.eval()
     device = next(model.parameters()).device
+    eval_rng = None
+    if deterministic_mask:
+        eval_rng = torch.Generator(device=device)
+        eval_rng.manual_seed(int(mask_seed))
     loss_sum, steps = 0.0, 0
     use = records[:min(max_eval, len(records))]
 
@@ -1270,7 +1444,7 @@ def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=1,
         batch = [(r["id"], r["sequence"]) for r in kept]
         _, _, toks = batch_converter(batch)
         toks = toks.to(device)
-        inp, labels = _make_masked_batch(toks, alphabet, mask_prob=mask_prob)
+        inp, labels = _make_masked_batch(toks, alphabet, mask_prob=mask_prob, rng=eval_rng)
 
         try:
             out = model(inp)
@@ -1423,11 +1597,13 @@ def train_lora_esm(model, alphabet, batch_converter, train_records, val_records,
                 batch_size=max(1, args.bs),
                 mask_prob=args.esm_mask_prob,
                 max_eval=args.esm_eval_max_items,
+                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
             )
             hist_ppl.append(float(ppl))
-            print(f"[ESM-FT] step {step}/{cfg.steps} | train_loss={total:.4f} | eval_pPPL={ppl:.4f}")
+            print(f"[ESM-FT] step {step}/{cfg.steps} | train_loss={total:.4f} | eval_pPPL={ppl:.4f}", flush=True)
         if no_improve >= cfg.early_stop_patience:
-            print(f"[ESM-FT early-stop] no improvement {no_improve} steps")
+            print(f"[ESM-FT early-stop] no improvement {no_improve} steps", flush=True)
             break
     return {"train_loss_traj": hist, "steps_done": len(hist), "eval_ppl_per_step": hist_ppl}
 
@@ -1463,16 +1639,93 @@ def _build_or_load_fixed_subset(test_records, out_dir, subset_n=500, seed=42):
     return subset, manifest
 
 
+def _parse_esm_eval_modes(mode_arg):
+    if mode_arg is None:
+        return {"ppl", "long_range"}
+    s = str(mode_arg).strip().lower()
+    if s in ("", "all"):
+        return {"ppl", "long_range"}
+    if s in ("none", "off", "skip"):
+        return set()
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    alias = {
+        "ppl": "ppl",
+        "pseudo_ppl": "ppl",
+        "eval_esm_pseudo_ppl": "ppl",
+        "long_range": "long_range",
+        "long_range_pl": "long_range",
+        "eval_long_range_pl": "long_range",
+    }
+    out = set()
+    for p in parts:
+        if p in alias:
+            out.add(alias[p])
+    return out
+
+
+def _read_esm_baseline_cache(cache_path):
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return {}
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_esm_baseline_cache(cache_path, payload):
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, eval_modes):
+    key_obj = {
+        "seed": int(seed),
+        "model_name": str(args.esm_model_name),
+        "local_model_pt": str(args.esm_local_model_pt),
+        "data_path": str(args.esm_data_path),
+        "data_format": str(args.esm_data_format),
+        "split_manifest": str(split_manifest),
+        "subset_manifest": str(subset_manifest),
+        "eval_modes": sorted(list(eval_modes)),
+        "esm_mask_prob": float(args.esm_mask_prob),
+        "esm_eval_deterministic_mask": bool(getattr(args, "esm_eval_deterministic_mask", False)),
+        "esm_eval_mask_seed": int(getattr(args, "esm_eval_mask_seed", 42)),
+        "esm_eval_max_items": int(args.esm_eval_max_items),
+        "esm_contact_batch_size": int(args.esm_contact_batch_size),
+        "bs": int(args.bs),
+    }
+    return json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+
+
+def _tlog_start(tag):
+    ts = time.time()
+    print(f"[time] start {tag}", flush=True)
+    return ts
+
+
+def _tlog_end(tag, ts):
+    print(f"[time] done  {tag} | elapsed={time.time() - ts:.2f}s", flush=True)
+
+
 def run_job_esm(job, out_dir, args):
+    t_job = _tlog_start("run_job_esm")
     os.makedirs(out_dir, exist_ok=True)
 
+    t_data = _tlog_start("load_structure_records")
     records, dropped = load_structure_records(
         data_path=args.esm_data_path,
         data_format=args.esm_data_format,
         max_records=args.esm_max_records if args.esm_max_records > 0 else None,
     )
     write_dropped_records(dropped, Path(out_dir) / "dropped_samples.csv")
+    _tlog_end("load_structure_records", t_data)
 
+    t_split = _tlog_start("split_records")
     split_manifest = Path(out_dir) / "split_manifest.json"
     train_idx, test_idx, val_idx = _split_structure_records(
         records,
@@ -1484,16 +1737,30 @@ def run_job_esm(job, out_dir, args):
     train_records = [records[i] for i in train_idx]
     test_records = [records[i] for i in test_idx]
     val_records = [records[i] for i in val_idx]
+    _tlog_end("split_records", t_split)
 
+    t_model = _tlog_start("load_esm_model")
     model, alphabet, batch_converter = _load_esm_model(args)
+    _tlog_end("load_esm_model", t_model)
 
     target_modules = job.get("target_modules", args.esm_target_modules)
     target_modules = parse_target_modules(target_modules)
     rank = int(job.get("rank", job.get("r", args.esm_rank)))
+    layer_filter = _parse_layer_filter(job.get("layer", None), job.get("layers", None))
     seed = int(job.get("seed", args.SEED))
     set_all_seeds(seed)
 
-    model = build_peft(model, target_modules=target_modules, r=rank)
+    if rank > 0:
+        model, native_lora_meta = build_native_esm_lora(
+            model,
+            target_modules=target_modules,
+            r=rank,
+            lora_alpha=rank,
+            lora_dropout=0.05,
+            layer_filter=layer_filter,
+        )
+    else:
+        native_lora_meta = {"injected": 0, "matched": [], "missing": [], "layers": layer_filter}
 
     # -------------------------
     # Fixed subset
@@ -1505,37 +1772,79 @@ def run_job_esm(job, out_dir, args):
         seed=args.esm_split_seed,
     )
 
+    eval_modes = _parse_esm_eval_modes(getattr(args, "esm_eval_modes", "ppl,long_range"))
+    do_ppl = "ppl" in eval_modes
+    do_long_range = "long_range" in eval_modes
+
     # -------------------------
     # Base eval
     # -------------------------
-    ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=max(1, args.bs),
-        mask_prob=args.esm_mask_prob,
-        max_eval=args.esm_eval_max_items,
-    )
-    clear_cuda("after ppl_base")
+    ppl_base = float("nan")
+    ppl_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
+    pl_full_base = float("nan")
+    per_full_base = []
+    pl_full_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
+    pl_fixed_base = float("nan")
+    pl_fixed_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
 
-    pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_full_base")
+    baseline_cache_path = Path(out_dir) / "esm_baseline_cache.json"
+    baseline_key = _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, eval_modes)
+    baseline_cache = _read_esm_baseline_cache(baseline_cache_path)
+    cached_base = baseline_cache.get(baseline_key) if rank > 0 else None
 
-    pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
-        model,
-        fixed_subset,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_fixed_base")
+    if cached_base is not None:
+        print("[info] using cached ESM baseline metrics")
+        ppl_base = float(cached_base.get("ppl_base", float("nan")))
+        ppl_base_stats = cached_base.get("ppl_base_stats", ppl_base_stats)
+        pl_full_base = float(cached_base.get("pl_full_base", float("nan")))
+        pl_full_base_stats = cached_base.get("pl_full_base_stats", pl_full_base_stats)
+        pl_fixed_base = float(cached_base.get("pl_fixed_base", float("nan")))
+        pl_fixed_base_stats = cached_base.get("pl_fixed_base_stats", pl_fixed_base_stats)
+    else:
+        t_base = _tlog_start("baseline_eval")
+        if do_ppl:
+            ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=max(1, args.bs),
+                mask_prob=args.esm_mask_prob,
+                max_eval=args.esm_eval_max_items,
+                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
+            )
+            clear_cuda("after ppl_base")
+
+        if do_long_range:
+            pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_full_base")
+
+            pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
+                model,
+                fixed_subset,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_fixed_base")
+        _tlog_end("baseline_eval", t_base)
+
+        baseline_cache[baseline_key] = {
+            "ppl_base": ppl_base,
+            "ppl_base_stats": ppl_base_stats,
+            "pl_full_base": pl_full_base,
+            "pl_full_base_stats": pl_full_base_stats,
+            "pl_fixed_base": pl_fixed_base,
+            "pl_fixed_base_stats": pl_fixed_base_stats,
+        }
+        _write_esm_baseline_cache(baseline_cache_path, baseline_cache)
 
     # -------------------------
     # Stage 1
@@ -1550,36 +1859,47 @@ def run_job_esm(job, out_dir, args):
         early_stop_patience=args.es_patience,
         early_stop_delta=args.es_delta,
     )
+    t_s1_train = _tlog_start("stage1_train")
     ft1_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft1, args)
+    _tlog_end("stage1_train", t_s1_train)
 
-    ppl_s1, ppl_s1_stats = eval_esm_pseudo_ppl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=max(1, args.bs),
-        mask_prob=args.esm_mask_prob,
-        max_eval=args.esm_eval_max_items,
-    )
-    clear_cuda("after ppl_s1")
+    t_s1_eval = _tlog_start("stage1_eval")
+    ppl_s1, ppl_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
+    if do_ppl:
+        ppl_s1, ppl_s1_stats = eval_esm_pseudo_ppl(
+            model,
+            test_records,
+            alphabet,
+            batch_converter,
+            batch_size=max(1, args.bs),
+            mask_prob=args.esm_mask_prob,
+            max_eval=args.esm_eval_max_items,
+            deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+            mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
+        )
+        clear_cuda("after ppl_s1")
 
-    pl_full_s1, per_full_s1, pl_full_s1_stats = eval_long_range_pl(
-        model,
-        test_records,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_full_s1")
+    pl_full_s1, per_full_s1, pl_full_s1_stats = float("nan"), [], {"skipped": True, "reason": "esm_eval_modes"}
+    pl_fixed_s1, pl_fixed_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
+    if do_long_range:
+        pl_full_s1, per_full_s1, pl_full_s1_stats = eval_long_range_pl(
+            model,
+            test_records,
+            alphabet,
+            batch_converter,
+            batch_size=args.esm_contact_batch_size,
+        )
+        clear_cuda("after pl_full_s1")
 
-    pl_fixed_s1, _, pl_fixed_s1_stats = eval_long_range_pl(
-        model,
-        fixed_subset,
-        alphabet,
-        batch_converter,
-        batch_size=args.esm_contact_batch_size,
-    )
-    clear_cuda("after pl_fixed_s1")
+        pl_fixed_s1, _, pl_fixed_s1_stats = eval_long_range_pl(
+            model,
+            fixed_subset,
+            alphabet,
+            batch_converter,
+            batch_size=args.esm_contact_batch_size,
+        )
+        clear_cuda("after pl_fixed_s1")
+    _tlog_end("stage1_eval", t_s1_eval)
 
     # -------------------------
     # Stage 2
@@ -1596,6 +1916,7 @@ def run_job_esm(job, out_dir, args):
     pl_fixed_s2_stats = pl_fixed_s1_stats
 
     if go_s2 and args.s2_steps > 0:
+        t_s2_train = _tlog_start("stage2_train")
         ft2 = FTConfig(
             steps=args.s2_steps,
             lr=args.s2_lr,
@@ -1607,35 +1928,42 @@ def run_job_esm(job, out_dir, args):
             early_stop_delta=args.es_delta,
         )
         ft2_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft2, args)
+        _tlog_end("stage2_train", t_s2_train)
 
-        ppl_s2, ppl_s2_stats = eval_esm_pseudo_ppl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=max(1, args.bs),
-            mask_prob=args.esm_mask_prob,
-            max_eval=args.esm_eval_max_items,
-        )
-        clear_cuda("after ppl_s2")
+        t_s2_eval = _tlog_start("stage2_eval")
+        if do_ppl:
+            ppl_s2, ppl_s2_stats = eval_esm_pseudo_ppl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=max(1, args.bs),
+                mask_prob=args.esm_mask_prob,
+                max_eval=args.esm_eval_max_items,
+                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
+            )
+            clear_cuda("after ppl_s2")
 
-        pl_full_s2, per_full_s2, pl_full_s2_stats = eval_long_range_pl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_full_s2")
+        if do_long_range:
+            pl_full_s2, per_full_s2, pl_full_s2_stats = eval_long_range_pl(
+                model,
+                test_records,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_full_s2")
 
-        pl_fixed_s2, _, pl_fixed_s2_stats = eval_long_range_pl(
-            model,
-            fixed_subset,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_fixed_s2")
+            pl_fixed_s2, _, pl_fixed_s2_stats = eval_long_range_pl(
+                model,
+                fixed_subset,
+                alphabet,
+                batch_converter,
+                batch_size=args.esm_contact_batch_size,
+            )
+            clear_cuda("after pl_fixed_s2")
+        _tlog_end("stage2_eval", t_s2_eval)
 
     rec = {
         **job,
@@ -1643,6 +1971,11 @@ def run_job_esm(job, out_dir, args):
         "seed": seed,
         "target_modules": target_modules,
         "rank": rank,
+        "layer_filter": layer_filter,
+        "native_lora": native_lora_meta,
+        "esm_eval_modes": sorted(list(eval_modes)),
+        "esm_eval_deterministic_mask": bool(getattr(args, "esm_eval_deterministic_mask", False)),
+        "esm_eval_mask_seed": int(getattr(args, "esm_eval_mask_seed", 42)),
         "dataset": {
             "data_path": str(args.esm_data_path),
             "train_size": len(train_records),
@@ -1707,6 +2040,7 @@ def run_job_esm(job, out_dir, args):
 
     hard_free(model, alphabet, batch_converter, tag="run_job_esm end")
     model = alphabet = batch_converter = None
+    _tlog_end("run_job_esm", t_job)
     return rec
 
 # def extract_gsm_num(text):
@@ -2113,6 +2447,16 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--esm_mask_prob", type=float, default=0.15)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument("--esm_eval_deterministic_mask", action="store_true",
+                    help="评估阶段使用固定mask（训练仍随机mask）")
+    ap.add_argument("--esm_eval_mask_seed", type=int, default=42,
+                    help="评估固定mask使用的随机种子")
+    ap.add_argument(
+        "--esm_eval_modes",
+        type=str,
+        default="ppl,long_range",
+        help="控制 ESM2 评测项：all/none 或逗号分隔 [ppl,long_range]",
+    )
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2326,6 +2670,16 @@ if __name__ == "__main__":
     ap.add_argument("--esm_mask_prob", type=float, default=0.15)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument("--esm_eval_deterministic_mask", action="store_true",
+                    help="评估阶段使用固定mask（训练仍随机mask）")
+    ap.add_argument("--esm_eval_mask_seed", type=int, default=42,
+                    help="评估固定mask使用的随机种子")
+    ap.add_argument(
+        "--esm_eval_modes",
+        type=str,
+        default="ppl,long_range",
+        help="控制 ESM2 评测项：all/none 或逗号分隔 [ppl,long_range]",
+    )
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
