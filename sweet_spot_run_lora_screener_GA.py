@@ -1376,13 +1376,16 @@ def _split_structure_records(records, split_manifest_path, train_n=12000, test_n
     return train_idx, test_idx, val_idx
 
 
-def _make_masked_batch(tokens, alphabet, mask_prob=0.15):
+def _make_masked_batch(tokens, alphabet, mask_prob=0.15, rng=None):
     labels = tokens.clone()
     special = torch.zeros_like(tokens, dtype=torch.bool)
     for idx in [alphabet.padding_idx, alphabet.cls_idx, alphabet.eos_idx]:
         special |= tokens.eq(idx)
     can_mask = ~special
-    rand = torch.rand_like(tokens.float())
+    if rng is None:
+        rand = torch.rand_like(tokens.float())
+    else:
+        rand = torch.rand(tokens.shape, device=tokens.device, dtype=torch.float32, generator=rng)
     mask_pos = (rand < mask_prob) & can_mask
     labels[~mask_pos] = -100
     inputs = tokens.clone()
@@ -1391,7 +1394,18 @@ def _make_masked_batch(tokens, alphabet, mask_prob=0.15):
 
 
 @torch.no_grad()
-def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=1, mask_prob=0.15, max_eval=512, max_len=768):
+def eval_esm_pseudo_ppl(
+    model,
+    records,
+    alphabet,
+    batch_converter,
+    batch_size=1,
+    mask_prob=0.15,
+    max_eval=512,
+    max_len=768,
+    deterministic_mask=False,
+    mask_seed=42,
+):
     
     stats = {
     "total_seen": 0,
@@ -1406,6 +1420,10 @@ def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=1,
 
     model.eval()
     device = next(model.parameters()).device
+    eval_rng = None
+    if deterministic_mask:
+        eval_rng = torch.Generator(device=device)
+        eval_rng.manual_seed(int(mask_seed))
     loss_sum, steps = 0.0, 0
     use = records[:min(max_eval, len(records))]
 
@@ -1421,7 +1439,7 @@ def eval_esm_pseudo_ppl(model, records, alphabet, batch_converter, batch_size=1,
         batch = [(r["id"], r["sequence"]) for r in kept]
         _, _, toks = batch_converter(batch)
         toks = toks.to(device)
-        inp, labels = _make_masked_batch(toks, alphabet, mask_prob=mask_prob)
+        inp, labels = _make_masked_batch(toks, alphabet, mask_prob=mask_prob, rng=eval_rng)
 
         try:
             out = model(inp)
@@ -1574,6 +1592,8 @@ def train_lora_esm(model, alphabet, batch_converter, train_records, val_records,
                 batch_size=max(1, args.bs),
                 mask_prob=args.esm_mask_prob,
                 max_eval=args.esm_eval_max_items,
+                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
             )
             hist_ppl.append(float(ppl))
             print(f"[ESM-FT] step {step}/{cfg.steps} | train_loss={total:.4f} | eval_pPPL={ppl:.4f}")
@@ -1668,6 +1688,8 @@ def _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, ev
         "subset_manifest": str(subset_manifest),
         "eval_modes": sorted(list(eval_modes)),
         "esm_mask_prob": float(args.esm_mask_prob),
+        "esm_eval_deterministic_mask": bool(getattr(args, "esm_eval_deterministic_mask", False)),
+        "esm_eval_mask_seed": int(getattr(args, "esm_eval_mask_seed", 42)),
         "esm_eval_max_items": int(args.esm_eval_max_items),
         "esm_contact_batch_size": int(args.esm_contact_batch_size),
         "bs": int(args.bs),
@@ -1784,6 +1806,8 @@ def run_job_esm(job, out_dir, args):
                 batch_size=max(1, args.bs),
                 mask_prob=args.esm_mask_prob,
                 max_eval=args.esm_eval_max_items,
+                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
             )
             clear_cuda("after ppl_base")
 
@@ -1845,6 +1869,8 @@ def run_job_esm(job, out_dir, args):
             batch_size=max(1, args.bs),
             mask_prob=args.esm_mask_prob,
             max_eval=args.esm_eval_max_items,
+            deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+            mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
         )
         clear_cuda("after ppl_s1")
 
@@ -1909,6 +1935,8 @@ def run_job_esm(job, out_dir, args):
                 batch_size=max(1, args.bs),
                 mask_prob=args.esm_mask_prob,
                 max_eval=args.esm_eval_max_items,
+                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
+                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
             )
             clear_cuda("after ppl_s2")
 
@@ -1941,6 +1969,8 @@ def run_job_esm(job, out_dir, args):
         "layer_filter": layer_filter,
         "native_lora": native_lora_meta,
         "esm_eval_modes": sorted(list(eval_modes)),
+        "esm_eval_deterministic_mask": bool(getattr(args, "esm_eval_deterministic_mask", False)),
+        "esm_eval_mask_seed": int(getattr(args, "esm_eval_mask_seed", 42)),
         "dataset": {
             "data_path": str(args.esm_data_path),
             "train_size": len(train_records),
@@ -2412,6 +2442,10 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--esm_mask_prob", type=float, default=0.15)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument("--esm_eval_deterministic_mask", action="store_true",
+                    help="评估阶段使用固定mask（训练仍随机mask）")
+    ap.add_argument("--esm_eval_mask_seed", type=int, default=42,
+                    help="评估固定mask使用的随机种子")
     ap.add_argument(
         "--esm_eval_modes",
         type=str,
@@ -2631,6 +2665,10 @@ if __name__ == "__main__":
     ap.add_argument("--esm_mask_prob", type=float, default=0.15)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_contact_batch_size", type=int, default=1)
+    ap.add_argument("--esm_eval_deterministic_mask", action="store_true",
+                    help="评估阶段使用固定mask（训练仍随机mask）")
+    ap.add_argument("--esm_eval_mask_seed", type=int, default=42,
+                    help="评估固定mask使用的随机种子")
     ap.add_argument(
         "--esm_eval_modes",
         type=str,
