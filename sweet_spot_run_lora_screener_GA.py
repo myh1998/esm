@@ -1644,15 +1644,12 @@ def _extract_esm_last_hidden(outputs):
         if "representations" in outputs and isinstance(outputs["representations"], dict) and len(outputs["representations"]) > 0:
             last_key = max(outputs["representations"].keys())
             return outputs["representations"][last_key]
-        if "logits" in outputs and outputs["logits"] is not None:
-            return outputs["logits"]
-    if hasattr(outputs, "logits") and outputs.logits is not None:
-        return outputs.logits
-    raise RuntimeError("Cannot extract hidden states from ESM outputs")
+    raise RuntimeError("Cannot extract hidden states from ESM outputs (logits fallback disabled)")
 
 
 def _forward_esm_regression(model, head, toks, alphabet):
-    out = model(toks)
+    repr_layer = int(getattr(model, "num_layers", len(getattr(model, "layers", []))))
+    out = model(toks, repr_layers=[repr_layer], return_contacts=False)
     hidden = _extract_esm_last_hidden(out)
     valid = torch.ones_like(toks, dtype=torch.bool)
     for idx in [alphabet.padding_idx, alphabet.cls_idx, alphabet.eos_idx]:
@@ -2803,6 +2800,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     })  
 
     rec = {"spearman_s2": float("nan"), "nas_obj": float("nan")}
+    had_error = False
     for i, job in enumerate(jobs, 1):
         print(f"[{i}/{len(jobs)}] run: {job}")
         # set_all_seeds(job['seed'])
@@ -3007,6 +3005,7 @@ if __name__ == "__main__":
     if args.max_items and args.max_items > 0:
         jobs = jobs[:args.max_items]
 
+    had_error = False
     for i, job in enumerate(jobs, 1):
         print(f"[{i}/{len(jobs)}] run: {job}")
         
@@ -3032,12 +3031,17 @@ if __name__ == "__main__":
                     "| nas_obj=", rec.get("nas_obj"),
                 )
         except RuntimeError as e:
+            had_error = True
             print("[fail][RuntimeError]", e)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
         except Exception as e:
+            had_error = True
             if _is_hf_network_error(e):
                 print("[info] Hugging Face network error ignored:", e)
                 continue
             print("[fail]", e)
+
+    if had_error:
+        sys.exit(1)
