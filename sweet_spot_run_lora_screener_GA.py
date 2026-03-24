@@ -1685,14 +1685,111 @@ def _build_regression_records(split, label_field):
     return out
 
 
-def load_hf_regression_dataset(hf_dataset_id, label_field):
-    ds = load_dataset(hf_dataset_id)
-    if "train" not in ds or "validation" not in ds or "test" not in ds:
-        raise RuntimeError(f"dataset {hf_dataset_id} must contain train/validation/test splits")
-    train_records = _build_regression_records(ds["train"], label_field)
-    val_records = _build_regression_records(ds["validation"], label_field)
-    test_records = _build_regression_records(ds["test"], label_field)
+def _normalize_split_tag(x):
+    s = str(x).strip().lower()
+    if s in ("train", "tr", "training"):
+        return "train"
+    if s in ("valid", "validation", "val", "dev"):
+        return "validation"
+    if s in ("test", "te", "holdout"):
+        return "test"
+    return None
+
+
+def _split_records_random(records, val_ratio=0.1, test_ratio=0.2, seed=42):
+    n = len(records)
+    if n < 3:
+        raise RuntimeError(f"not enough records for split: n={n}")
+    rng = np.random.RandomState(int(seed))
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_test = max(1, int(round(n * float(test_ratio))))
+    n_val = max(1, int(round(n * float(val_ratio))))
+    n_train = n - n_val - n_test
+    if n_train < 1:
+        n_train = 1
+        n_val = max(1, n - n_train - n_test)
+        if n_train + n_val + n_test > n:
+            n_test = n - n_train - n_val
+    tr = idx[:n_train]
+    va = idx[n_train:n_train + n_val]
+    te = idx[n_train + n_val:n_train + n_val + n_test]
+    train_records = [records[int(i)] for i in tr]
+    val_records = [records[int(i)] for i in va]
+    test_records = [records[int(i)] for i in te]
     return train_records, val_records, test_records
+
+
+def load_hf_regression_dataset(hf_dataset_id, label_field, split_column="auto", val_ratio=0.1, test_ratio=0.2, split_seed=42):
+    ds = load_dataset(hf_dataset_id)
+
+    if "train" in ds and "validation" in ds and "test" in ds:
+        train_records = _build_regression_records(ds["train"], label_field)
+        val_records = _build_regression_records(ds["validation"], label_field)
+        test_records = _build_regression_records(ds["test"], label_field)
+        info = {
+            "source": "official_split",
+            "column": None,
+            "stage_values": None,
+        }
+        print(
+            f"[info] split_source=official_split | train={len(train_records)} val={len(val_records)} test={len(test_records)}",
+            flush=True,
+        )
+        return train_records, val_records, test_records, info
+
+    if "train" not in ds:
+        raise RuntimeError(f"dataset {hf_dataset_id} must contain at least train split")
+
+    train_split = ds["train"]
+    records_all = _build_regression_records(train_split, label_field)
+
+    # 优先级：显式指定列 > auto(stage优先) > 其他候选列
+    candidates = []
+    if split_column and str(split_column).lower() != "auto":
+        candidates.append(str(split_column))
+    else:
+        candidates.extend(["stage", "split", "set", "subset", "partition", "fold"])
+
+    for col in candidates:
+        if col not in train_split.column_names:
+            continue
+        raw_tags = train_split[col]
+        buckets = {"train": [], "validation": [], "test": []}
+        raw_unique = sorted({str(x) for x in raw_tags})
+        for i, tag in enumerate(raw_tags):
+            k = _normalize_split_tag(tag)
+            if k is not None:
+                buckets[k].append(records_all[i])
+        if all(len(buckets[k]) > 0 for k in ("train", "validation", "test")):
+            info = {
+                "source": "column_split",
+                "column": col,
+                "stage_values": raw_unique,
+            }
+            print(
+                f"[info] split_source=column_split | column={col} | values={raw_unique} | "
+                f"train={len(buckets['train'])} val={len(buckets['validation'])} test={len(buckets['test'])}",
+                flush=True,
+            )
+            return buckets["train"], buckets["validation"], buckets["test"], info
+
+    # 最后兜底：随机切分
+    train_records, val_records, test_records = _split_records_random(
+        records_all, val_ratio=val_ratio, test_ratio=test_ratio, seed=split_seed
+    )
+    info = {
+        "source": "random_split",
+        "column": None,
+        "stage_values": None,
+    }
+    print(
+        "[warn] split_source=random_split | "
+        f"val_ratio={val_ratio} test_ratio={test_ratio} seed={split_seed} | "
+        f"train={len(train_records)} val={len(val_records)} test={len(test_records)}",
+        flush=True,
+    )
+    return train_records, val_records, test_records, info
 
 
 def eval_esm_regression(model, head, records, alphabet, batch_converter, batch_size=1, max_eval=None):
@@ -1939,9 +2036,13 @@ def run_job_esm(job, out_dir, args):
     os.makedirs(out_dir, exist_ok=True)
 
     t_data = _tlog_start("load_hf_regression_dataset")
-    train_records, val_records, test_records = load_hf_regression_dataset(
+    train_records, val_records, test_records, split_info = load_hf_regression_dataset(
         hf_dataset_id=args.hf_dataset_id,
         label_field=args.label_field,
+        split_column=args.hf_split_column,
+        val_ratio=args.hf_val_ratio,
+        test_ratio=args.hf_test_ratio,
+        split_seed=args.hf_split_seed,
     )
     _tlog_end("load_hf_regression_dataset", t_data)
 
@@ -2085,6 +2186,9 @@ def run_job_esm(job, out_dir, args):
         "dataset": {
             "hf_dataset_id": str(args.hf_dataset_id),
             "label_field": str(args.label_field),
+            "split_source": split_info.get("source"),
+            "split_column": split_info.get("column"),
+            "split_values": split_info.get("stage_values"),
             "train_size": len(train_records),
             "test_size": len(test_records),
             "val_size": len(val_records),
@@ -2536,6 +2640,10 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
     ap.add_argument("--hf_dataset_id", type=str, default="SaProtHub/Dataset-Fluorescence-TAPE")
     ap.add_argument("--label_field", type=str, default="label")
+    ap.add_argument("--hf_split_column", type=str, default="auto")
+    ap.add_argument("--hf_val_ratio", type=float, default=0.1)
+    ap.add_argument("--hf_test_ratio", type=float, default=0.2)
+    ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
@@ -2741,6 +2849,10 @@ if __name__ == "__main__":
     ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
     ap.add_argument("--hf_dataset_id", type=str, default="SaProtHub/Dataset-Fluorescence-TAPE")
     ap.add_argument("--label_field", type=str, default="label")
+    ap.add_argument("--hf_split_column", type=str, default="auto")
+    ap.add_argument("--hf_val_ratio", type=float, default=0.1)
+    ap.add_argument("--hf_test_ratio", type=float, default=0.2)
+    ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
