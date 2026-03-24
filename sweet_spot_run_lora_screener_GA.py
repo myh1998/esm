@@ -1664,17 +1664,34 @@ def _forward_esm_regression(model, head, toks, alphabet):
     return preds
 
 
-def _build_regression_records(split, label_field):
+def _build_regression_records(split, label_field, sequence_field="auto"):
     out = []
+    field_counter = {}
+
     for i, rec in enumerate(split):
         if label_field not in rec:
             raise KeyError(f"label_field '{label_field}' not found in dataset record keys={list(rec.keys())}")
-        seq = rec.get("sequence", rec.get("seq"))
-        if seq is None:
-            raise KeyError("dataset record missing sequence/seq field")
+
+        if sequence_field and str(sequence_field).lower() != "auto":
+            seq_key = str(sequence_field)
+            seq = rec.get(seq_key)
+            if seq is None:
+                raise KeyError(f"sequence_field '{seq_key}' not found in record keys={list(rec.keys())}")
+        else:
+            seq_key = None
+            for cand in ("sequence", "seq", "protein", "mutant", "aa_seq"):
+                if cand in rec and rec.get(cand) is not None:
+                    seq_key = cand
+                    break
+            if seq_key is None:
+                raise KeyError("dataset record missing sequence field (tried: sequence/seq/protein/mutant/aa_seq)")
+            seq = rec.get(seq_key)
+
         seq = str(seq).strip()
         if not seq:
             continue
+
+        field_counter[seq_key] = field_counter.get(seq_key, 0) + 1
         label = float(rec[label_field])
         out.append({
             "id": str(rec.get("id", f"sample_{i:07d}")),
@@ -1682,6 +1699,10 @@ def _build_regression_records(split, label_field):
             "label": label,
             "length": len(seq),
         })
+
+    if len(field_counter) > 0:
+        print(f"[info] sequence_field usage: {field_counter}", flush=True)
+
     return out
 
 
@@ -1720,13 +1741,13 @@ def _split_records_random(records, val_ratio=0.1, test_ratio=0.2, seed=42):
     return train_records, val_records, test_records
 
 
-def load_hf_regression_dataset(hf_dataset_id, label_field, split_column="auto", val_ratio=0.1, test_ratio=0.2, split_seed=42):
+def load_hf_regression_dataset(hf_dataset_id, label_field, sequence_field="auto", split_column="auto", val_ratio=0.1, test_ratio=0.2, split_seed=42):
     ds = load_dataset(hf_dataset_id)
 
     if "train" in ds and "validation" in ds and "test" in ds:
-        train_records = _build_regression_records(ds["train"], label_field)
-        val_records = _build_regression_records(ds["validation"], label_field)
-        test_records = _build_regression_records(ds["test"], label_field)
+        train_records = _build_regression_records(ds["train"], label_field, sequence_field=sequence_field)
+        val_records = _build_regression_records(ds["validation"], label_field, sequence_field=sequence_field)
+        test_records = _build_regression_records(ds["test"], label_field, sequence_field=sequence_field)
         info = {
             "source": "official_split",
             "column": None,
@@ -1742,7 +1763,7 @@ def load_hf_regression_dataset(hf_dataset_id, label_field, split_column="auto", 
         raise RuntimeError(f"dataset {hf_dataset_id} must contain at least train split")
 
     train_split = ds["train"]
-    records_all = _build_regression_records(train_split, label_field)
+    records_all = _build_regression_records(train_split, label_field, sequence_field=sequence_field)
 
     # 优先级：显式指定列 > auto(stage优先) > 其他候选列
     candidates = []
@@ -2039,6 +2060,7 @@ def run_job_esm(job, out_dir, args):
     train_records, val_records, test_records, split_info = load_hf_regression_dataset(
         hf_dataset_id=args.hf_dataset_id,
         label_field=args.label_field,
+        sequence_field=args.sequence_field,
         split_column=args.hf_split_column,
         val_ratio=args.hf_val_ratio,
         test_ratio=args.hf_test_ratio,
@@ -2186,6 +2208,7 @@ def run_job_esm(job, out_dir, args):
         "dataset": {
             "hf_dataset_id": str(args.hf_dataset_id),
             "label_field": str(args.label_field),
+            "sequence_field": str(args.sequence_field),
             "split_source": split_info.get("source"),
             "split_column": split_info.get("column"),
             "split_values": split_info.get("stage_values"),
@@ -2640,6 +2663,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
     ap.add_argument("--hf_dataset_id", type=str, default="SaProtHub/Dataset-Fluorescence-TAPE")
     ap.add_argument("--label_field", type=str, default="label")
+    ap.add_argument("--sequence_field", type=str, default="auto")
     ap.add_argument("--hf_split_column", type=str, default="auto")
     ap.add_argument("--hf_val_ratio", type=float, default=0.1)
     ap.add_argument("--hf_test_ratio", type=float, default=0.2)
@@ -2849,6 +2873,7 @@ if __name__ == "__main__":
     ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
     ap.add_argument("--hf_dataset_id", type=str, default="SaProtHub/Dataset-Fluorescence-TAPE")
     ap.add_argument("--label_field", type=str, default="label")
+    ap.add_argument("--sequence_field", type=str, default="auto")
     ap.add_argument("--hf_split_column", type=str, default="auto")
     ap.add_argument("--hf_val_ratio", type=float, default=0.1)
     ap.add_argument("--hf_test_ratio", type=float, default=0.2)
