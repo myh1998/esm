@@ -1878,7 +1878,7 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
 
     params = [p for _, p in model.named_parameters() if p.requires_grad] + [p for p in head.parameters() if p.requires_grad]
     if (not has_lora) and len([p for p in head.parameters() if p.requires_grad]) == 0:
-        return {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": []}
+        return {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
 
     opt = AdamW(params, lr=cfg.lr)
     from transformers import get_linear_schedule_with_warmup
@@ -1887,7 +1887,7 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
     sch = get_linear_schedule_with_warmup(opt, warmup, total_steps)
     crit = nn.MSELoss() if str(getattr(args, "reg_loss", "mse")).lower() == "mse" else nn.HuberLoss(delta=1.0)
 
-    hist, hist_sp = [], []
+    hist, hist_sp, hist_rmse = [], [], []
     best = float("inf")
     no_improve = 0
 
@@ -1923,14 +1923,16 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
                 max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
             )
             sp = float(metrics.get("spearman", float("nan")))
+            rmse = float(metrics.get("rmse", float("nan")))
             hist_sp.append(sp)
+            hist_rmse.append(rmse)
             print(f"[ESM-REG] step {step}/{cfg.steps} | train_loss={l:.4f} | eval_spearman={sp:.4f}", flush=True)
 
         if no_improve >= cfg.early_stop_patience:
             print(f"[ESM-REG early-stop] no improvement {no_improve} steps", flush=True)
             break
 
-    return {"train_loss_traj": hist, "steps_done": len(hist), "eval_spearman_per_step": hist_sp}
+    return {"train_loss_traj": hist, "steps_done": len(hist), "eval_spearman_per_step": hist_sp, "eval_rmse_per_step": hist_rmse}
 
 
 def _apply_esm_30gb_profile(args):
@@ -2147,7 +2149,7 @@ def run_job_esm(job, out_dir, args):
     s1_sp = float(s1_metrics.get("spearman", float("nan")))
     go_s2 = (s1_sp - base_sp) >= float(args.s2_gate_delta) if args.s2_gate_delta is not None else True
 
-    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": []}
+    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
     s2_metrics, s2_stats = dict(s1_metrics), dict(s1_stats)
 
     if go_s2 and args.s2_steps > 0:
@@ -2193,6 +2195,14 @@ def run_job_esm(job, out_dir, args):
     def _m(d, k):
         return float(d.get(k, float("nan")))
 
+    s1_sp_hist = [float(x) for x in ft1_log.get("eval_spearman_per_step", []) if not np.isnan(float(x))]
+    s2_sp_hist = [float(x) for x in ft2_log.get("eval_spearman_per_step", []) if not np.isnan(float(x))]
+    s1_rmse_hist = [float(x) for x in ft1_log.get("eval_rmse_per_step", []) if not np.isnan(float(x))]
+    s2_rmse_hist = [float(x) for x in ft2_log.get("eval_rmse_per_step", []) if not np.isnan(float(x))]
+
+    best_spearman_ft = max(s1_sp_hist + s2_sp_hist) if (len(s1_sp_hist) + len(s2_sp_hist)) > 0 else float(s2_metrics.get("spearman", float("nan")))
+    best_rmse_ft = min(s1_rmse_hist + s2_rmse_hist) if (len(s1_rmse_hist) + len(s2_rmse_hist)) > 0 else float(s2_metrics.get("rmse", float("nan")))
+
     rec = {
         **job,
         "mode": "esm",
@@ -2216,10 +2226,12 @@ def run_job_esm(job, out_dir, args):
         "spearman_base": _m(base_metrics, "spearman"),
         "spearman_s1": _m(s1_metrics, "spearman"),
         "spearman_s2": _m(s2_metrics, "spearman"),
+        "spearman_s2_best_ft": best_spearman_ft,
         "spearman_test_final": _m(final_metrics, "spearman"),
         "rmse_base": _m(base_metrics, "rmse"),
         "rmse_s1": _m(s1_metrics, "rmse"),
         "rmse_s2": _m(s2_metrics, "rmse"),
+        "rmse_s2_best_ft": best_rmse_ft,
         "rmse_test_final": _m(final_metrics, "rmse"),
         "mae_base": _m(base_metrics, "mae"),
         "mae_s1": _m(s1_metrics, "mae"),
@@ -2232,6 +2244,7 @@ def run_job_esm(job, out_dir, args):
         "gate_delta": float(args.s2_gate_delta),
         "go_s2": bool(go_s2),
         "nas_obj": 1.0 - _m(s2_metrics, "spearman"),
+        "nas_obj_best_ft": 1.0 - best_spearman_ft,
         "regression_head": {
             "pooling": "mean",
             "hidden_dim": hidden_dim,
@@ -2815,9 +2828,9 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
             rec = run_job(job, args.model_id, args.out_dir, args)
             if args.model_family == "esm2":
                 print(
-                    "[ok] spearman_s2=", rec.get("spearman_s2"),
-                    "| rmse_s2=", rec.get("rmse_s2"),
-                    "| nas_obj=", rec.get("nas_obj"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
                 print(
                     "[eval-summary] regression:",
@@ -2826,9 +2839,9 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
                 )
             else:
                 print(
-                    "[ok] spearman_s2=", rec.get("spearman_s2"),
-                    "| rmse_s2=", rec.get("rmse_s2"),
-                    "| nas_obj=", rec.get("nas_obj"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
         except RuntimeError as e:
             print("[fail][RuntimeError]", e)
@@ -2853,7 +2866,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     print(f"\033[1;31m[ Time used: --------------------------------------------------- {time.time() - start_time} --------------------------------------------------- ]\033[0m")
 
     if args.model_family == "esm2":
-        return rec.get("spearman_s2"), rec.get("nas_obj")
+        return rec.get("spearman_s2_best_ft"), rec.get("nas_obj_best_ft")
     return rec.get("val_ppl"), rec.get("delta_val_ppl")
 
 # -------------------------
@@ -3015,9 +3028,9 @@ if __name__ == "__main__":
             rec = run_job(job, args.model_id, args.out_dir, args)
             if args.model_family == "esm2":
                 print(
-                    "[ok] spearman_s2=", rec.get("spearman_s2"),
-                    "| rmse_s2=", rec.get("rmse_s2"),
-                    "| nas_obj=", rec.get("nas_obj"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
                 print(
                     "[eval-summary] regression:",
@@ -3026,9 +3039,9 @@ if __name__ == "__main__":
                 )
             else:
                 print(
-                    "[ok] spearman_s2=", rec.get("spearman_s2"),
-                    "| rmse_s2=", rec.get("rmse_s2"),
-                    "| nas_obj=", rec.get("nas_obj"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
         except RuntimeError as e:
             had_error = True
