@@ -1856,6 +1856,10 @@ def eval_esm_regression(model, head, records, alphabet, batch_converter, batch_s
     return {"spearman": sp, "pearson": pr, "rmse": rmse, "mae": mae}, stats
 
 
+def _eval_bs(args):
+    return max(1, int(getattr(args, "esm_eval_bs", 1)))
+
+
 def save_esm_regression_checkpoint(model, head, out_dir, meta):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1919,7 +1923,7 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
         if step % max(1, cfg.eval_every) == 0:
             metrics, _ = eval_esm_regression(
                 model, head, val_records, alphabet, batch_converter,
-                batch_size=max(1, args.bs),
+                batch_size=_eval_bs(args),
                 max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
             )
             sp = float(metrics.get("spearman", float("nan")))
@@ -2104,6 +2108,7 @@ def run_job_esm(job, out_dir, args):
         "hf_dataset_id": str(args.hf_dataset_id),
         "label_field": str(args.label_field),
         "esm_eval_max_items": int(args.esm_eval_max_items),
+        "esm_eval_bs": _eval_bs(args),
         "bs": int(args.bs),
     }, sort_keys=True, ensure_ascii=False)
     baseline_cache = _read_esm_baseline_cache(baseline_cache_path)
@@ -2117,7 +2122,7 @@ def run_job_esm(job, out_dir, args):
         t_base = _tlog_start("baseline_eval")
         base_metrics, base_stats = eval_esm_regression(
             model, head, gate_records, alphabet, batch_converter,
-            batch_size=max(1, args.bs),
+            batch_size=_eval_bs(args),
             max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
         )
         _tlog_end("baseline_eval", t_base)
@@ -2141,7 +2146,7 @@ def run_job_esm(job, out_dir, args):
 
     s1_metrics, s1_stats = eval_esm_regression(
         model, head, gate_records, alphabet, batch_converter,
-        batch_size=max(1, args.bs),
+        batch_size=_eval_bs(args),
         max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
     )
 
@@ -2170,13 +2175,13 @@ def run_job_esm(job, out_dir, args):
 
         s2_metrics, s2_stats = eval_esm_regression(
             model, head, gate_records, alphabet, batch_converter,
-            batch_size=max(1, args.bs),
+            batch_size=_eval_bs(args),
             max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
         )
 
     final_metrics, final_stats = eval_esm_regression(
         model, head, final_test_records, alphabet, batch_converter,
-        batch_size=max(1, args.bs),
+        batch_size=_eval_bs(args),
         max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
     )
 
@@ -2679,6 +2684,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--hf_test_ratio", type=float, default=0.2)
     ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
+    ap.add_argument("--esm_eval_bs", type=int, default=1)
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2890,6 +2896,7 @@ if __name__ == "__main__":
     ap.add_argument("--hf_test_ratio", type=float, default=0.2)
     ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
+    ap.add_argument("--esm_eval_bs", type=int, default=1)
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
