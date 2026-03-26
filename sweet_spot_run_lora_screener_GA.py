@@ -11,6 +11,7 @@ E) PPL评估优化：确保模型在正确状态下评估，避免训练状态�
 """
 
 import os, json, time, math, argparse, gc, csv, sys
+import hashlib
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -39,6 +40,7 @@ import re
 
 from datasets import load_dataset, load_from_disk
 import esm
+from scipy.stats import spearmanr, pearsonr
 
 try:
     from lm_eval import simple_evaluate
@@ -1625,6 +1627,346 @@ def _load_esm_model(args):
     batch_converter = alphabet.get_batch_converter()
     return model, alphabet, batch_converter
 
+class ESMRegressionHead(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(int(hidden_dim), 1)
+
+    def forward(self, x):
+        return self.linear(x).squeeze(-1)
+
+
+def _extract_esm_last_hidden(outputs):
+    if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+        return outputs.last_hidden_state
+    if isinstance(outputs, dict):
+        if "last_hidden_state" in outputs and outputs["last_hidden_state"] is not None:
+            return outputs["last_hidden_state"]
+        if "representations" in outputs and isinstance(outputs["representations"], dict) and len(outputs["representations"]) > 0:
+            last_key = max(outputs["representations"].keys())
+            return outputs["representations"][last_key]
+    raise RuntimeError("Cannot extract hidden states from ESM outputs (logits fallback disabled)")
+
+
+def _forward_esm_regression(model, head, toks, alphabet):
+    repr_layer = int(getattr(model, "num_layers", len(getattr(model, "layers", []))))
+    out = model(toks, repr_layers=[repr_layer], return_contacts=False)
+    hidden = _extract_esm_last_hidden(out)
+    valid = torch.ones_like(toks, dtype=torch.bool)
+    for idx in [alphabet.padding_idx, alphabet.cls_idx, alphabet.eos_idx]:
+        valid &= toks.ne(idx)
+    valid_f = valid.unsqueeze(-1).to(hidden.dtype)
+    denom = valid_f.sum(dim=1).clamp_min(1.0)
+    pooled = (hidden * valid_f).sum(dim=1) / denom
+    preds = head(pooled)
+    return preds
+
+
+def _build_regression_records(split, label_field, sequence_field="auto"):
+    out = []
+    field_counter = {}
+
+    for i, rec in enumerate(split):
+        if label_field not in rec:
+            raise KeyError(f"label_field '{label_field}' not found in dataset record keys={list(rec.keys())}")
+
+        if sequence_field and str(sequence_field).lower() != "auto":
+            seq_key = str(sequence_field)
+            seq = rec.get(seq_key)
+            if seq is None:
+                raise KeyError(f"sequence_field '{seq_key}' not found in record keys={list(rec.keys())}")
+        else:
+            seq_key = None
+            for cand in ("sequence", "seq", "protein", "mutant", "aa_seq"):
+                if cand in rec and rec.get(cand) is not None:
+                    seq_key = cand
+                    break
+            if seq_key is None:
+                raise KeyError("dataset record missing sequence field (tried: sequence/seq/protein/mutant/aa_seq)")
+            seq = rec.get(seq_key)
+
+        seq = str(seq).strip()
+        if not seq:
+            continue
+
+        field_counter[seq_key] = field_counter.get(seq_key, 0) + 1
+        label = float(rec[label_field])
+        out.append({
+            "id": str(rec.get("id", f"sample_{i:07d}")),
+            "sequence": seq,
+            "label": label,
+            "length": len(seq),
+        })
+
+    if len(field_counter) > 0:
+        print(f"[info] sequence_field usage: {field_counter}", flush=True)
+
+    return out
+
+
+def _normalize_split_tag(x):
+    s = str(x).strip().lower()
+    if s in ("train", "tr", "training"):
+        return "train"
+    if s in ("valid", "validation", "val", "dev"):
+        return "validation"
+    if s in ("test", "te", "holdout"):
+        return "test"
+    return None
+
+
+def _split_records_random(records, val_ratio=0.1, test_ratio=0.2, seed=42):
+    n = len(records)
+    if n < 3:
+        raise RuntimeError(f"not enough records for split: n={n}")
+    rng = np.random.RandomState(int(seed))
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_test = max(1, int(round(n * float(test_ratio))))
+    n_val = max(1, int(round(n * float(val_ratio))))
+    n_train = n - n_val - n_test
+    if n_train < 1:
+        n_train = 1
+        n_val = max(1, n - n_train - n_test)
+        if n_train + n_val + n_test > n:
+            n_test = n - n_train - n_val
+    tr = idx[:n_train]
+    va = idx[n_train:n_train + n_val]
+    te = idx[n_train + n_val:n_train + n_val + n_test]
+    train_records = [records[int(i)] for i in tr]
+    val_records = [records[int(i)] for i in va]
+    test_records = [records[int(i)] for i in te]
+    return train_records, val_records, test_records
+
+
+def load_hf_regression_dataset(hf_dataset_id, label_field, sequence_field="auto", split_column="auto", val_ratio=0.1, test_ratio=0.2, split_seed=42):
+    ds = load_dataset(hf_dataset_id)
+
+    if "train" in ds and "validation" in ds and "test" in ds:
+        train_records = _build_regression_records(ds["train"], label_field, sequence_field=sequence_field)
+        val_records = _build_regression_records(ds["validation"], label_field, sequence_field=sequence_field)
+        test_records = _build_regression_records(ds["test"], label_field, sequence_field=sequence_field)
+        info = {
+            "source": "official_split",
+            "column": None,
+            "stage_values": None,
+        }
+        print(
+            f"[info] split_source=official_split | train={len(train_records)} val={len(val_records)} test={len(test_records)}",
+            flush=True,
+        )
+        return train_records, val_records, test_records, info
+
+    if "train" not in ds:
+        raise RuntimeError(f"dataset {hf_dataset_id} must contain at least train split")
+
+    train_split = ds["train"]
+    records_all = _build_regression_records(train_split, label_field, sequence_field=sequence_field)
+
+    # 优先级：显式指定列 > auto(stage优先) > 其他候选列
+    candidates = []
+    if split_column and str(split_column).lower() != "auto":
+        candidates.append(str(split_column))
+    else:
+        candidates.extend(["stage", "split", "set", "subset", "partition", "fold"])
+
+    for col in candidates:
+        if col not in train_split.column_names:
+            continue
+        raw_tags = train_split[col]
+        buckets = {"train": [], "validation": [], "test": []}
+        raw_unique = sorted({str(x) for x in raw_tags})
+        for i, tag in enumerate(raw_tags):
+            k = _normalize_split_tag(tag)
+            if k is not None:
+                buckets[k].append(records_all[i])
+        if all(len(buckets[k]) > 0 for k in ("train", "validation", "test")):
+            info = {
+                "source": "column_split",
+                "column": col,
+                "stage_values": raw_unique,
+            }
+            print(
+                f"[info] split_source=column_split | column={col} | values={raw_unique} | "
+                f"train={len(buckets['train'])} val={len(buckets['validation'])} test={len(buckets['test'])}",
+                flush=True,
+            )
+            return buckets["train"], buckets["validation"], buckets["test"], info
+
+    # 最后兜底：随机切分
+    train_records, val_records, test_records = _split_records_random(
+        records_all, val_ratio=val_ratio, test_ratio=test_ratio, seed=split_seed
+    )
+    info = {
+        "source": "random_split",
+        "column": None,
+        "stage_values": None,
+    }
+    print(
+        "[warn] split_source=random_split | "
+        f"val_ratio={val_ratio} test_ratio={test_ratio} seed={split_seed} | "
+        f"train={len(train_records)} val={len(val_records)} test={len(test_records)}",
+        flush=True,
+    )
+    return train_records, val_records, test_records, info
+
+
+def eval_esm_regression(model, head, records, alphabet, batch_converter, batch_size=1, max_eval=None):
+    stats = {
+        "total_seen": 0,
+        "evaluated": 0,
+        "skipped_oom": 0,
+    }
+    if len(records) == 0:
+        return {"spearman": float("nan"), "pearson": float("nan"), "rmse": float("nan"), "mae": float("nan")}, stats
+
+    model.eval(); head.eval()
+    device = next(model.parameters()).device
+    use = records if max_eval is None else records[:min(max_eval, len(records))]
+    ys, ps = [], []
+
+    for i in range(0, len(use), batch_size):
+        chunk = use[i:i + batch_size]
+        stats["total_seen"] += len(chunk)
+        batch = [(r["id"], r["sequence"]) for r in chunk]
+        _, _, toks = batch_converter(batch)
+        toks = toks.to(device)
+        targets = torch.tensor([float(r["label"]) for r in chunk], device=device, dtype=torch.float32)
+        try:
+            preds = _forward_esm_regression(model, head, toks, alphabet)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                stats["skipped_oom"] += len(chunk)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            raise
+        ys.extend(targets.detach().cpu().tolist())
+        ps.extend(preds.detach().cpu().tolist())
+        stats["evaluated"] += len(chunk)
+
+    if len(ys) == 0:
+        return {"spearman": float("nan"), "pearson": float("nan"), "rmse": float("nan"), "mae": float("nan")}, stats
+
+    y = np.asarray(ys, dtype=np.float64)
+    p = np.asarray(ps, dtype=np.float64)
+    sp = float(spearmanr(y, p).correlation)
+    pr = float(pearsonr(y, p)[0]) if len(y) > 1 else float("nan")
+    rmse = float(np.sqrt(np.mean((p - y) ** 2)))
+    mae = float(np.mean(np.abs(p - y)))
+    return {"spearman": sp, "pearson": pr, "rmse": rmse, "mae": mae}, stats
+
+
+def _eval_bs(args):
+    return max(1, int(getattr(args, "esm_eval_bs", 1)))
+
+
+def save_esm_regression_checkpoint(model, head, out_dir, meta):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = out_dir / "esm_regression_checkpoint.pt"
+    payload = {
+        "head_state": head.state_dict(),
+        "meta": meta,
+    }
+    torch.save(payload, ckpt)
+    return str(ckpt)
+
+
+def load_esm_regression_checkpoint(head, ckpt_path):
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.exists():
+        return False, {}
+    payload = torch.load(str(ckpt_path), map_location="cpu")
+    state = payload.get("head_state", payload)
+    head.load_state_dict(state, strict=True)
+    return True, payload.get("meta", {})
+
+
+def _head_warmstart_key(args):
+    key_obj = {
+        "esm_model_name": str(args.esm_model_name),
+        "hf_dataset_id": str(args.hf_dataset_id),
+        "label_field": str(args.label_field),
+        "sequence_field": str(args.sequence_field),
+        "split_column": str(args.hf_split_column),
+        "split_seed": int(args.hf_split_seed),
+        "reg_loss": str(args.reg_loss),
+        "seq_len": int(args.seq_len),
+        "s1_steps": int(args.s1_steps),
+        "s1_lr": float(args.s1_lr),
+    }
+    raw = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, cfg: FTConfig, args):
+    device = next(model.parameters()).device
+    model.train(); head.train()
+
+    has_lora = freeze_base_params(model)
+    for p in head.parameters():
+        p.requires_grad = True
+
+    params = [p for _, p in model.named_parameters() if p.requires_grad] + [p for p in head.parameters() if p.requires_grad]
+    if (not has_lora) and len([p for p in head.parameters() if p.requires_grad]) == 0:
+        return {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+
+    opt = AdamW(params, lr=cfg.lr)
+    from transformers import get_linear_schedule_with_warmup
+    total_steps = max(1, int(cfg.steps))
+    warmup = int(cfg.warmup_ratio * total_steps)
+    sch = get_linear_schedule_with_warmup(opt, warmup, total_steps)
+    crit = nn.MSELoss() if str(getattr(args, "reg_loss", "mse")).lower() == "mse" else nn.HuberLoss(delta=1.0)
+
+    hist, hist_sp, hist_rmse = [], [], []
+    best = float("inf")
+    no_improve = 0
+
+    pool = train_records if len(train_records) > 0 else val_records
+    for step in range(1, cfg.steps + 1):
+        model.train(); head.train()
+        idx = np.random.choice(len(pool), size=min(len(pool), cfg.batch_size), replace=False)
+        batch = [pool[int(i)] for i in np.atleast_1d(idx)]
+        pairs = [(r["id"], r["sequence"]) for r in batch]
+        _, _, toks = batch_converter(pairs)
+        toks = toks.to(device)
+        targets = torch.tensor([float(r["label"]) for r in batch], dtype=torch.float32, device=device)
+
+        preds = _forward_esm_regression(model, head, toks, alphabet)
+        loss = crit(preds, targets) / max(1, cfg.grad_accum)
+        loss.backward()
+
+        if step % max(1, cfg.grad_accum) == 0:
+            torch.nn.utils.clip_grad_norm_(params, cfg.clip_grad_norm)
+            opt.step(); sch.step(); opt.zero_grad(set_to_none=True)
+
+        l = float(loss.item()) * max(1, cfg.grad_accum)
+        hist.append(l)
+        if l < best - cfg.early_stop_delta:
+            best = l; no_improve = 0
+        else:
+            no_improve += 1
+
+        if step % max(1, cfg.eval_every) == 0:
+            metrics, _ = eval_esm_regression(
+                model, head, val_records, alphabet, batch_converter,
+                batch_size=_eval_bs(args),
+                max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
+            )
+            sp = float(metrics.get("spearman", float("nan")))
+            rmse = float(metrics.get("rmse", float("nan")))
+            hist_sp.append(sp)
+            hist_rmse.append(rmse)
+            print(f"[ESM-REG] step {step}/{cfg.steps} | train_loss={l:.4f} | eval_spearman={sp:.4f}", flush=True)
+
+        if no_improve >= cfg.early_stop_patience:
+            print(f"[ESM-REG early-stop] no improvement {no_improve} steps", flush=True)
+            break
+
+    return {"train_loss_traj": hist, "steps_done": len(hist), "eval_spearman_per_step": hist_sp, "eval_rmse_per_step": hist_rmse}
+
+
 def _apply_esm_30gb_profile(args):
     if not bool(getattr(args, "esm_30gb_stable_profile", False)):
         return args
@@ -1632,9 +1974,7 @@ def _apply_esm_30gb_profile(args):
     args.seq_len = min(int(args.seq_len), 256)   # 先别压到128
     args.bs = min(int(args.bs), 1)
     args.ga = max(int(args.ga), 4)               # 你qsub本来就想用4
-    args.esm_eval_modes = "ppl"
     args.esm_eval_max_items = min(int(args.esm_eval_max_items), 512)
-    args.esm_contact_batch_size = 1
     args.s1_lr = min(float(args.s1_lr), 1e-4)
     args.s2_lr = min(float(args.s2_lr), 5e-5)
     args.s1_warmup_ratio = max(float(args.s1_warmup_ratio), 0.10)
@@ -1645,7 +1985,7 @@ def _apply_esm_30gb_profile(args):
         f"seq_len={args.seq_len}, bs={args.bs}, ga={args.ga}, "
         f"s1_lr={args.s1_lr}, s2_lr={args.s2_lr}, "
         f"s1_warmup={args.s1_warmup_ratio}, s2_warmup={args.s2_warmup_ratio}, "
-        f"esm_eval_modes={args.esm_eval_modes}, esm_eval_max_items={args.esm_eval_max_items}",
+        f"esm_eval_max_items={args.esm_eval_max_items}",
         flush=True,
     )
     return args
@@ -1747,28 +2087,17 @@ def run_job_esm(job, out_dir, args):
     t_job = _tlog_start("run_job_esm")
     os.makedirs(out_dir, exist_ok=True)
 
-    t_data = _tlog_start("load_structure_records")
-    records, dropped = load_structure_records(
-        data_path=args.esm_data_path,
-        data_format=args.esm_data_format,
-        max_records=args.esm_max_records if args.esm_max_records > 0 else None,
+    t_data = _tlog_start("load_hf_regression_dataset")
+    train_records, val_records, test_records, split_info = load_hf_regression_dataset(
+        hf_dataset_id=args.hf_dataset_id,
+        label_field=args.label_field,
+        sequence_field=args.sequence_field,
+        split_column=args.hf_split_column,
+        val_ratio=args.hf_val_ratio,
+        test_ratio=args.hf_test_ratio,
+        split_seed=args.hf_split_seed,
     )
-    write_dropped_records(dropped, Path(out_dir) / "dropped_samples.csv")
-    _tlog_end("load_structure_records", t_data)
-
-    t_split = _tlog_start("split_records")
-    split_manifest = Path(out_dir) / "split_manifest.json"
-    train_idx, test_idx, val_idx = _split_structure_records(
-        records,
-        split_manifest_path=split_manifest,
-        train_n=args.esm_train_size,
-        test_n=args.esm_test_size,
-        seed=args.esm_split_seed,
-    )
-    train_records = [records[i] for i in train_idx]
-    test_records = [records[i] for i in test_idx]
-    val_records = [records[i] for i in val_idx]
-    _tlog_end("split_records", t_split)
+    _tlog_end("load_hf_regression_dataset", t_data)
 
     t_model = _tlog_start("load_esm_model")
     model, alphabet, batch_converter = _load_esm_model(args)
@@ -1793,172 +2122,83 @@ def run_job_esm(job, out_dir, args):
     else:
         native_lora_meta = {"injected": 0, "matched": [], "missing": [], "layers": layer_filter}
 
-    # -------------------------
-    # Fixed subset
-    # -------------------------
-    fixed_subset, subset_manifest = _build_or_load_fixed_subset(
-        test_records,
-        out_dir=Path(out_dir),
-        subset_n=args.esm_fixed_subset_size,
-        seed=args.esm_split_seed,
-    )
+    hidden_dim = int(getattr(model, "embed_dim", getattr(getattr(model, "args", None), "embed_dim", 1280)))
+    head = ESMRegressionHead(hidden_dim).to(next(model.parameters()).device)
+    warmstart_dir = Path(out_dir) / "head_warmstart"
+    warmstart_dir.mkdir(parents=True, exist_ok=True)
+    warmstart_path = warmstart_dir / f"head_{_head_warmstart_key(args)}.pt"
+    head_loaded, head_loaded_meta = (False, {})
+    if str(getattr(args, "head_warmstart_mode", "auto")).lower() == "auto":
+        head_loaded, head_loaded_meta = load_esm_regression_checkpoint(head, warmstart_path)
+        if head_loaded:
+            print(f"[info] loaded head warmstart: {warmstart_path}", flush=True)
 
-    eval_modes = _parse_esm_eval_modes(getattr(args, "esm_eval_modes", "ppl,long_range"))
-    do_ppl = "ppl" in eval_modes
-    do_long_range = "long_range" in eval_modes
-
-    # p-ppl 的门控与阶段正式打分统一走 validation
     gate_records = val_records
-
-    # test 只留给最后一次汇报，不参与 S2 gate 和配置选择
     final_test_records = test_records
-    # -------------------------
-    # Base eval
-    # -------------------------
-    ppl_base = float("nan")
-    ppl_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
-    pl_full_base = float("nan")
-    per_full_base = []
-    pl_full_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
-    pl_fixed_base = float("nan")
-    pl_fixed_base_stats = {"skipped": True, "reason": "esm_eval_modes"}
 
-    # 改个文件名，避免误读旧的 test-based baseline cache
-    baseline_cache_path = Path(out_dir) / "esm_baseline_cache_val_gate.json"
-    baseline_key = _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, eval_modes)
+    baseline_cache_path = Path(out_dir) / "esm_regression_baseline_cache_val_gate.json"
+    baseline_key = json.dumps({
+        "seed": int(seed),
+        "model_name": str(args.esm_model_name),
+        "local_model_pt": str(args.esm_local_model_pt),
+        "hf_dataset_id": str(args.hf_dataset_id),
+        "label_field": str(args.label_field),
+        "esm_eval_max_items": int(args.esm_eval_max_items),
+        "esm_eval_bs": _eval_bs(args),
+        "bs": int(args.bs),
+    }, sort_keys=True, ensure_ascii=False)
     baseline_cache = _read_esm_baseline_cache(baseline_cache_path)
     cached_base = baseline_cache.get(baseline_key) if rank > 0 else None
 
     if cached_base is not None:
-        print("[info] using cached ESM validation-gate baseline metrics")
-        ppl_base = float(cached_base.get("ppl_base", float("nan")))
-        ppl_base_stats = cached_base.get("ppl_base_stats", ppl_base_stats)
-        pl_full_base = float(cached_base.get("pl_full_base", float("nan")))
-        pl_full_base_stats = cached_base.get("pl_full_base_stats", pl_full_base_stats)
-        pl_fixed_base = float(cached_base.get("pl_fixed_base", float("nan")))
-        pl_fixed_base_stats = cached_base.get("pl_fixed_base_stats", pl_fixed_base_stats)
+        print("[info] using cached ESM regression validation-gate baseline metrics")
+        base_metrics = cached_base.get("base_metrics", {})
+        base_stats = cached_base.get("base_stats", {"skipped": False, "cached": True})
     else:
         t_base = _tlog_start("baseline_eval")
-        if do_ppl:
-            ppl_base, ppl_base_stats = eval_esm_pseudo_ppl(
-                model,
-                gate_records,
-                alphabet,
-                batch_converter,
-                batch_size=max(1, args.bs),
-                mask_prob=args.esm_mask_prob,
-                max_eval=args.esm_eval_max_items,
-                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
-                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
-            )
-            clear_cuda("after ppl_base")
-
-        if do_long_range:
-            pl_full_base, per_full_base, pl_full_base_stats = eval_long_range_pl(
-                model,
-                test_records,
-                alphabet,
-                batch_converter,
-                batch_size=args.esm_contact_batch_size,
-            )
-            clear_cuda("after pl_full_base")
-
-            pl_fixed_base, _, pl_fixed_base_stats = eval_long_range_pl(
-                model,
-                fixed_subset,
-                alphabet,
-                batch_converter,
-                batch_size=args.esm_contact_batch_size,
-            )
-            clear_cuda("after pl_fixed_base")
+        base_metrics, base_stats = eval_esm_regression(
+            model, head, gate_records, alphabet, batch_converter,
+            batch_size=_eval_bs(args),
+            max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
+        )
         _tlog_end("baseline_eval", t_base)
-
-        baseline_cache[baseline_key] = {
-            "ppl_base": ppl_base,
-            "ppl_base_stats": ppl_base_stats,
-            "pl_full_base": pl_full_base,
-            "pl_full_base_stats": pl_full_base_stats,
-            "pl_fixed_base": pl_fixed_base,
-            "pl_fixed_base_stats": pl_fixed_base_stats,
-        }
+        baseline_cache[baseline_key] = {"base_metrics": base_metrics, "base_stats": base_stats}
         _write_esm_baseline_cache(baseline_cache_path, baseline_cache)
 
-    # -------------------------
-    # Stage 1
-    # -------------------------
-    ft1 = FTConfig(
-        steps=args.s1_steps,
-        lr=args.s1_lr,
-        warmup_ratio=args.s1_warmup_ratio,
-        seq_len=args.seq_len,
-        batch_size=args.bs,
-        grad_accum=args.ga,
-        eval_every=args.eval_every,
-        early_stop_patience=args.es_patience,
-        early_stop_delta=args.es_delta,
-    )
-    t_s1_train = _tlog_start("stage1_train")
-    ft1_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft1, args)
-    _tlog_end("stage1_train", t_s1_train)
-
-    t_s1_eval = _tlog_start("stage1_eval")
-    ppl_s1, ppl_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
-    if do_ppl:
-        ppl_s1, ppl_s1_stats = eval_esm_pseudo_ppl(
-            model,
-            gate_records,
-            alphabet,
-            batch_converter,
-            batch_size=max(1, args.bs),
-            mask_prob=args.esm_mask_prob,
-            max_eval=args.esm_eval_max_items,
-            deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
-            mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
+    if head_loaded and rank == 0:
+        print("[info] rank=0 baseline warmstart hit: skip S1/S2 training", flush=True)
+        ft1_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+        s1_metrics, s1_stats = dict(base_metrics), dict(base_stats)
+    else:
+        ft1 = FTConfig(
+            steps=args.s1_steps,
+            lr=args.s1_lr,
+            warmup_ratio=args.s1_warmup_ratio,
+            seq_len=args.seq_len,
+            batch_size=args.bs,
+            grad_accum=args.ga,
+            eval_every=args.eval_every,
+            early_stop_patience=args.es_patience,
+            early_stop_delta=args.es_delta,
         )
-        clear_cuda("after ppl_s1")
+        t_s1_train = _tlog_start("stage1_train")
+        ft1_log = train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, ft1, args)
+        _tlog_end("stage1_train", t_s1_train)
 
-    pl_full_s1, per_full_s1, pl_full_s1_stats = float("nan"), [], {"skipped": True, "reason": "esm_eval_modes"}
-    pl_fixed_s1, pl_fixed_s1_stats = float("nan"), {"skipped": True, "reason": "esm_eval_modes"}
-    if do_long_range:
-        pl_full_s1, per_full_s1, pl_full_s1_stats = eval_long_range_pl(
-            model,
-            test_records,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
+        s1_metrics, s1_stats = eval_esm_regression(
+            model, head, gate_records, alphabet, batch_converter,
+            batch_size=_eval_bs(args),
+            max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
         )
-        clear_cuda("after pl_full_s1")
 
-        pl_fixed_s1, _, pl_fixed_s1_stats = eval_long_range_pl(
-            model,
-            fixed_subset,
-            alphabet,
-            batch_converter,
-            batch_size=args.esm_contact_batch_size,
-        )
-        clear_cuda("after pl_fixed_s1")
-    _tlog_end("stage1_eval", t_s1_eval)
+    base_sp = float(base_metrics.get("spearman", float("nan")))
+    s1_sp = float(s1_metrics.get("spearman", float("nan")))
+    go_s2 = (s1_sp - base_sp) >= float(args.s2_gate_delta) if args.s2_gate_delta is not None else True
 
-    # -------------------------
-    # Stage 2
-    # -------------------------
-    go_s2 = (ppl_base - ppl_s1) >= args.s2_gate_delta if args.s2_gate_delta is not None else True
+    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+    s2_metrics, s2_stats = dict(s1_metrics), dict(s1_stats)
 
-    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_ppl_per_step": []}
-    ppl_s2, pl_full_s2, pl_fixed_s2 = ppl_s1, pl_full_s1, pl_fixed_s1
-    per_full_s2 = per_full_s1
-
-    # 默认沿用 s1 的 stats
-    ppl_s2_stats = ppl_s1_stats
-    pl_full_s2_stats = pl_full_s1_stats
-    pl_fixed_s2_stats = pl_fixed_s1_stats
-
-    # 最终 test 汇报先初始化，避免未定义
-    ppl_test_final = float("nan")
-    ppl_test_final_stats = {"skipped": True, "reason": "final_test_not_run_yet"}
-
-    if go_s2 and args.s2_steps > 0:
-        t_s2_train = _tlog_start("stage2_train")
+    if (not (head_loaded and rank == 0)) and go_s2 and args.s2_steps > 0:
         ft2 = FTConfig(
             steps=args.s2_steps,
             lr=args.s2_lr,
@@ -1970,146 +2210,139 @@ def run_job_esm(job, out_dir, args):
             early_stop_patience=args.es_patience,
             early_stop_delta=args.es_delta,
         )
-        ft2_log = train_lora_esm(model, alphabet, batch_converter, train_records, val_records, ft2, args)
+        t_s2_train = _tlog_start("stage2_train")
+        ft2_log = train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, ft2, args)
         _tlog_end("stage2_train", t_s2_train)
 
-        t_s2_eval = _tlog_start("stage2_eval")
-        if do_ppl:
-            ppl_s2, ppl_s2_stats = eval_esm_pseudo_ppl(
-                model,
-                gate_records,
-                alphabet,
-                batch_converter,
-                batch_size=max(1, args.bs),
-                mask_prob=args.esm_mask_prob,
-                max_eval=args.esm_eval_max_items,
-                deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
-                mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
-            )
-            clear_cuda("after ppl_s2")
-
-        if do_long_range:
-            pl_full_s2, per_full_s2, pl_full_s2_stats = eval_long_range_pl(
-                model,
-                test_records,
-                alphabet,
-                batch_converter,
-                batch_size=args.esm_contact_batch_size,
-            )
-            clear_cuda("after pl_full_s2")
-
-            pl_fixed_s2, _, pl_fixed_s2_stats = eval_long_range_pl(
-                model,
-                fixed_subset,
-                alphabet,
-                batch_converter,
-                batch_size=args.esm_contact_batch_size,
-            )
-            clear_cuda("after pl_fixed_s2")
-
-        _tlog_end("stage2_eval", t_s2_eval)
-
-    # -------------------------
-    # Final test eval (report only)
-    # -------------------------
-    t_final_test = _tlog_start("final_test_eval")
-    if do_ppl:
-        ppl_test_final, ppl_test_final_stats = eval_esm_pseudo_ppl(
-            model,
-            final_test_records,
-            alphabet,
-            batch_converter,
-            batch_size=max(1, args.bs),
-            mask_prob=args.esm_mask_prob,
-            max_eval=args.esm_eval_max_items,
-            deterministic_mask=bool(getattr(args, "esm_eval_deterministic_mask", False)),
-            mask_seed=int(getattr(args, "esm_eval_mask_seed", 42)),
+        s2_metrics, s2_stats = eval_esm_regression(
+            model, head, gate_records, alphabet, batch_converter,
+            batch_size=_eval_bs(args),
+            max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
         )
-        clear_cuda("after ppl_test_final")
-    _tlog_end("final_test_eval", t_final_test)
+
+    final_metrics, final_stats = eval_esm_regression(
+        model, head, final_test_records, alphabet, batch_converter,
+        batch_size=_eval_bs(args),
+        max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
+    )
+
+    if (not head_loaded) and rank == 0 and str(getattr(args, "head_warmstart_mode", "auto")).lower() == "auto":
+        save_esm_regression_checkpoint(
+            model, head, warmstart_dir,
+            meta={
+                "kind": "baseline_head_warmstart",
+                "path": str(warmstart_path),
+                "esm_model_name": str(args.esm_model_name),
+                "hf_dataset_id": str(args.hf_dataset_id),
+                "label_field": str(args.label_field),
+                "sequence_field": str(args.sequence_field),
+                "split_column": str(args.hf_split_column),
+            },
+        )
+        # 统一文件名保存，避免 save_esm_regression_checkpoint 的固定命名覆盖旧逻辑
+        (warmstart_dir / "esm_regression_checkpoint.pt").replace(warmstart_path)
+        print(f"[info] saved head warmstart: {warmstart_path}", flush=True)
+
+    ckpt_path = save_esm_regression_checkpoint(
+        model, head, Path(out_dir) / "checkpoints",
+        meta={
+            "hf_dataset_id": args.hf_dataset_id,
+            "label_field": args.label_field,
+            "pooling": "mean",
+            "hidden_dim": hidden_dim,
+            "rank": rank,
+            "target_modules": target_modules,
+        },
+    )
+
+    def _m(d, k):
+        return float(d.get(k, float("nan")))
+
+    s1_sp_hist = [float(x) for x in ft1_log.get("eval_spearman_per_step", []) if not np.isnan(float(x))]
+    s2_sp_hist = [float(x) for x in ft2_log.get("eval_spearman_per_step", []) if not np.isnan(float(x))]
+    s1_rmse_hist = [float(x) for x in ft1_log.get("eval_rmse_per_step", []) if not np.isnan(float(x))]
+    s2_rmse_hist = [float(x) for x in ft2_log.get("eval_rmse_per_step", []) if not np.isnan(float(x))]
+
+    best_spearman_ft = max(s1_sp_hist + s2_sp_hist) if (len(s1_sp_hist) + len(s2_sp_hist)) > 0 else float(s2_metrics.get("spearman", float("nan")))
+    best_rmse_ft = min(s1_rmse_hist + s2_rmse_hist) if (len(s1_rmse_hist) + len(s2_rmse_hist)) > 0 else float(s2_metrics.get("rmse", float("nan")))
 
     rec = {
         **job,
         "mode": "esm",
+        "task_type": "regression",
         "seed": seed,
         "target_modules": target_modules,
         "rank": rank,
         "layer_filter": layer_filter,
         "native_lora": native_lora_meta,
-        "esm_eval_modes": sorted(list(eval_modes)),
-        "esm_eval_deterministic_mask": bool(getattr(args, "esm_eval_deterministic_mask", False)),
-        "esm_eval_mask_seed": int(getattr(args, "esm_eval_mask_seed", 42)),
         "dataset": {
-            "data_path": str(args.esm_data_path),
+            "hf_dataset_id": str(args.hf_dataset_id),
+            "label_field": str(args.label_field),
+            "sequence_field": str(args.sequence_field),
+            "split_source": split_info.get("source"),
+            "split_column": split_info.get("column"),
+            "split_values": split_info.get("stage_values"),
             "train_size": len(train_records),
             "test_size": len(test_records),
             "val_size": len(val_records),
-            "split_manifest": str(split_manifest),
-            "fixed_subset_manifest": str(subset_manifest),
         },
-        # 下面这三个现在都是 validation-gate 指标
-        "ppl_base": ppl_base,
-        "ppl_s1": ppl_s1,
-        "ppl_s2": ppl_s2,
-        "delta_ppl_s1": ppl_s1 - ppl_base,
-        "delta_ppl_s2": ppl_s2 - ppl_base,
-
-        # test 只做最终汇报，不参与门控
-        "ppl_test_final": ppl_test_final,
-        "long_range_pl": {
-            "full_test_base": pl_full_base,
-            "full_test_s1": pl_full_s1,
-            "full_test_s2": pl_full_s2,
-            "fixed_500_base": pl_fixed_base,
-            "fixed_500_s1": pl_fixed_s1,
-            "fixed_500_s2": pl_fixed_s2,
-            "delta_full_s2": pl_full_s2 - pl_full_base,
-            "delta_fixed_s2": pl_fixed_s2 - pl_fixed_base,
+        "spearman_base": _m(base_metrics, "spearman"),
+        "spearman_s1": _m(s1_metrics, "spearman"),
+        "spearman_s2": _m(s2_metrics, "spearman"),
+        "spearman_s2_best_ft": best_spearman_ft,
+        "spearman_test_final": _m(final_metrics, "spearman"),
+        "rmse_base": _m(base_metrics, "rmse"),
+        "rmse_s1": _m(s1_metrics, "rmse"),
+        "rmse_s2": _m(s2_metrics, "rmse"),
+        "rmse_s2_best_ft": best_rmse_ft,
+        "rmse_test_final": _m(final_metrics, "rmse"),
+        "mae_base": _m(base_metrics, "mae"),
+        "mae_s1": _m(s1_metrics, "mae"),
+        "mae_s2": _m(s2_metrics, "mae"),
+        "mae_test_final": _m(final_metrics, "mae"),
+        "pearson_base": _m(base_metrics, "pearson"),
+        "pearson_s1": _m(s1_metrics, "pearson"),
+        "pearson_s2": _m(s2_metrics, "pearson"),
+        "pearson_test_final": _m(final_metrics, "pearson"),
+        "gate_delta": float(args.s2_gate_delta),
+        "go_s2": bool(go_s2),
+        "nas_obj": 1.0 - _m(s2_metrics, "spearman"),
+        "nas_obj_best_ft": 1.0 - best_spearman_ft,
+        "regression_head": {
+            "pooling": "mean",
+            "hidden_dim": hidden_dim,
+            "checkpoint": ckpt_path,
+            "warmstart_mode": str(getattr(args, "head_warmstart_mode", "auto")),
+            "warmstart_path": str(warmstart_path),
+            "warmstart_loaded": bool(head_loaded),
+            "warmstart_loaded_meta": head_loaded_meta,
         },
         "s1_log": ft1_log,
         "s2_log": ft2_log,
         "lora_params": count_lora_params(model),
         "tokens_trained": (ft1_log["steps_done"] + ft2_log["steps_done"]) * args.bs * args.ga,
         "eval_stats": {
-            "ppl_base": ppl_base_stats,          # validation-gate
-            "ppl_s1": ppl_s1_stats,              # validation-gate
-            "ppl_s2": ppl_s2_stats,              # validation-gate
-            "ppl_test_final": ppl_test_final_stats,
-            "long_range_full_base": pl_full_base_stats,
-            "long_range_full_s1": pl_full_s1_stats,
-            "long_range_full_s2": pl_full_s2_stats,
-            "long_range_fixed_base": pl_fixed_base_stats,
-            "long_range_fixed_s1": pl_fixed_s1_stats,
-            "long_range_fixed_s2": pl_fixed_s2_stats,
+            "base": base_stats,
+            "s1": s1_stats,
+            "s2": s2_stats,
+            "test_final": final_stats,
         },
     }
 
     fname = f"esm_single_seed{seed}_r{rank}.json"
     if "name" in job:
-        safe_name = re.sub(r"[^a-zA-Z0-9_\\-]+", "_", str(job["name"]))
+        safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", str(job["name"]))
         fname = f"{safe_name}_seed{seed}_r{rank}.json"
 
     out_json = os.path.join(out_dir, fname)
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(rec, f, indent=2, ensure_ascii=False)
 
-    per_item_path = os.path.join(out_dir, fname.replace(".json", "_per_item_s2.csv"))
-    with open(per_item_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "long_range_pl", "length"])
-        writer.writeheader()
-        for row in per_full_s2:
-            writer.writerow(row)
-
-    rec["long_range_pl"]["full_test_s2_per_item_csv"] = per_item_path
-
-    # 如果你希望 JSON 里也带上 per-item csv 路径，可以再写一遍
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(rec, f, indent=2, ensure_ascii=False)
-
-    hard_free(model, alphabet, batch_converter, tag="run_job_esm end")
-    model = alphabet = batch_converter = None
+    hard_free(model, head, alphabet, batch_converter, tag="run_job_esm end")
+    model = head = alphabet = batch_converter = None
     _tlog_end("run_job_esm", t_job)
     return rec
+
 
 # def extract_gsm_num(text):
 #     m = re.search(r"####\s*(\d+)", text)
@@ -2505,26 +2738,16 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     # ESM2 / offline protein settings
     ap.add_argument("--esm_model_name", type=str, default="esm2_t36_3B_UR50D")
     ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
-    ap.add_argument("--esm_data_path", type=str, default="./assets/data/tr_rosetta")
-    ap.add_argument("--esm_data_format", type=str, default="auto", choices=["auto", "npz", "sidechainnet"])
-    ap.add_argument("--esm_train_size", type=int, default=12000)
-    ap.add_argument("--esm_test_size", type=int, default=2300)
-    ap.add_argument("--esm_split_seed", type=int, default=42)
-    ap.add_argument("--esm_fixed_subset_size", type=int, default=500)
-    ap.add_argument("--esm_max_records", type=int, default=0, help="0=use all")
-    ap.add_argument("--esm_mask_prob", type=float, default=0.15)
+    ap.add_argument("--hf_dataset_id", type=str, default="SaProtHub/Dataset-Fluorescence-TAPE")
+    ap.add_argument("--label_field", type=str, default="label")
+    ap.add_argument("--sequence_field", type=str, default="auto")
+    ap.add_argument("--hf_split_column", type=str, default="auto")
+    ap.add_argument("--hf_val_ratio", type=float, default=0.1)
+    ap.add_argument("--hf_test_ratio", type=float, default=0.2)
+    ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
-    ap.add_argument("--esm_contact_batch_size", type=int, default=1)
-    ap.add_argument("--esm_eval_deterministic_mask", action="store_true",
-                    help="评估阶段使用固定mask（训练仍随机mask）")
-    ap.add_argument("--esm_eval_mask_seed", type=int, default=42,
-                    help="评估固定mask使用的随机种子")
-    ap.add_argument(
-        "--esm_eval_modes",
-        type=str,
-        default="ppl,long_range",
-        help="控制 ESM2 评测项：all/none 或逗号分隔 [ppl,long_range]",
-    )
+    ap.add_argument("--esm_eval_bs", type=int, default=1)
+    ap.add_argument("--head_warmstart_mode", type=str, default="auto", choices=["off", "auto"])
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2556,7 +2779,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     # Stage 2
     ap.add_argument("--s2_steps", type=int, default=1000)
     ap.add_argument("--s2_lr", type=float, default=8e-5)
-    ap.add_argument("--s2_gate_delta", type=float, default=-999, help="进入S2的门槛：ppl_base - ppl_s1 >= gate")
+    ap.add_argument("--s2_gate_delta", type=float, default=0.005, help="进入S2的门槛：spearman_s1 - spearman_base >= gate")
 
     # 训练 & 早停 & 批配置
     ap.add_argument("--seq_len", type=int, default=512)
@@ -2569,6 +2792,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--ga_seq_len", type=int, default=256, help="LoRA-GA 梯度估计的序列长度")
     ap.add_argument("--ga_bs", type=int, default=2, help="LoRA-GA 梯度估计的batch size")
     ap.add_argument("--ga_samples", type=int, default=16, help="用于估计梯度的样本数上限")
+    ap.add_argument("--reg_loss", type=str, default="mse", choices=["mse", "huber"], help="回归损失函数")
 
     # 任务采样
     ap.add_argument("--max_items", type=int, default=1)
@@ -2657,7 +2881,8 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         "out_dir": args.out_dir,
     })  
 
-    rec = {"val_ppl": float("nan"), "delta_val_ppl": float("nan")}
+    rec = {"spearman_s2": float("nan"), "nas_obj": float("nan")}
+    had_error = False
     for i, job in enumerate(jobs, 1):
         print(f"[{i}/{len(jobs)}] run: {job}")
         # set_all_seeds(job['seed'])
@@ -2672,22 +2897,20 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
             rec = run_job(job, args.model_id, args.out_dir, args)
             if args.model_family == "esm2":
                 print(
-                    "[ok] ppl_s2=", rec.get("ppl_s2"),
-                    "| Δ=", rec.get("delta_ppl_s2"),
-                    "| long_range_full=", rec.get("long_range_pl", {}).get("full_test_s2"),
-                    "| long_range_fixed=", rec.get("long_range_pl", {}).get("fixed_500_s2"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
                 print(
-                    "[eval-summary] long_range_full:",
-                    rec.get("eval_stats", {}).get("long_range_full_s2"),
+                    "[eval-summary] regression:",
+                    rec.get("eval_stats", {}).get("s2"),
                     flush=True,
                 )
             else:
                 print(
-                    "[ok] ppl_s2=", rec.get("ppl_s2"),
-                    "| Δ=", rec.get("delta_ppl_s2"),
-                    "| val_ppl=", rec.get("val_ppl"),
-                    "| val_Δ=", rec.get("delta_val_ppl"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
         except RuntimeError as e:
             print("[fail][RuntimeError]", e)
@@ -2712,7 +2935,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     print(f"\033[1;31m[ Time used: --------------------------------------------------- {time.time() - start_time} --------------------------------------------------- ]\033[0m")
 
     if args.model_family == "esm2":
-        return rec.get("ppl_s2"), rec.get("delta_ppl_s2")
+        return rec.get("spearman_s2_best_ft"), rec.get("nas_obj_best_ft")
     return rec.get("val_ppl"), rec.get("delta_val_ppl")
 
 # -------------------------
@@ -2728,26 +2951,16 @@ if __name__ == "__main__":
     # ESM2 / offline protein settings
     ap.add_argument("--esm_model_name", type=str, default="esm2_t36_3B_UR50D")
     ap.add_argument("--esm_local_model_pt", type=str, default="./assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt")
-    ap.add_argument("--esm_data_path", type=str, default="./assets/data/tr_rosetta")
-    ap.add_argument("--esm_data_format", type=str, default="auto", choices=["auto", "npz", "sidechainnet"])
-    ap.add_argument("--esm_train_size", type=int, default=12000)
-    ap.add_argument("--esm_test_size", type=int, default=2300)
-    ap.add_argument("--esm_split_seed", type=int, default=42)
-    ap.add_argument("--esm_fixed_subset_size", type=int, default=500)
-    ap.add_argument("--esm_max_records", type=int, default=0, help="0=use all")
-    ap.add_argument("--esm_mask_prob", type=float, default=0.15)
+    ap.add_argument("--hf_dataset_id", type=str, default="SaProtHub/Dataset-Fluorescence-TAPE")
+    ap.add_argument("--label_field", type=str, default="label")
+    ap.add_argument("--sequence_field", type=str, default="auto")
+    ap.add_argument("--hf_split_column", type=str, default="auto")
+    ap.add_argument("--hf_val_ratio", type=float, default=0.1)
+    ap.add_argument("--hf_test_ratio", type=float, default=0.2)
+    ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
-    ap.add_argument("--esm_contact_batch_size", type=int, default=1)
-    ap.add_argument("--esm_eval_deterministic_mask", action="store_true",
-                    help="评估阶段使用固定mask（训练仍随机mask）")
-    ap.add_argument("--esm_eval_mask_seed", type=int, default=42,
-                    help="评估固定mask使用的随机种子")
-    ap.add_argument(
-        "--esm_eval_modes",
-        type=str,
-        default="ppl,long_range",
-        help="控制 ESM2 评测项：all/none 或逗号分隔 [ppl,long_range]",
-    )
+    ap.add_argument("--esm_eval_bs", type=int, default=1)
+    ap.add_argument("--head_warmstart_mode", type=str, default="auto", choices=["off", "auto"])
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2781,7 +2994,7 @@ if __name__ == "__main__":
     ap.add_argument("--s2_steps", type=int, default=300)
     ap.add_argument("--s2_lr", type=float, default=8e-5)
     ap.add_argument("--s2_warmup_ratio", type=float, default=0.10)
-    ap.add_argument("--s2_gate_delta", type=float, default=-0.02, help="进入S2的门槛：ppl_base - ppl_s1 >= gate")
+    ap.add_argument("--s2_gate_delta", type=float, default=0.005, help="进入S2的门槛：spearman_s1 - spearman_base >= gate")
 
     # 训练 & 早停 & 批配置
     ap.add_argument("--seq_len", type=int, default=512)
@@ -2794,6 +3007,7 @@ if __name__ == "__main__":
     ap.add_argument("--ga_seq_len", type=int, default=256, help="LoRA-GA 梯度估计的序列长度")
     ap.add_argument("--ga_bs", type=int, default=1, help="LoRA-GA 梯度估计的batch size")
     ap.add_argument("--ga_samples", type=int, default=16, help="用于估计梯度的样本数上限")
+    ap.add_argument("--reg_loss", type=str, default="mse", choices=["mse", "huber"], help="回归损失函数")
 
     # 任务采样
     ap.add_argument("--max_items", type=int, default=0)
@@ -2843,9 +3057,6 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     if args.fast_debug:
-        args.esm_train_size = min(args.esm_train_size, 200)
-        args.esm_test_size = min(args.esm_test_size, 40)
-        args.esm_fixed_subset_size = min(args.esm_fixed_subset_size, 20)
         args.esm_eval_max_items = min(args.esm_eval_max_items, 20)
         args.s1_steps = 0
         args.s2_steps = 0
@@ -2878,6 +3089,7 @@ if __name__ == "__main__":
     if args.max_items and args.max_items > 0:
         jobs = jobs[:args.max_items]
 
+    had_error = False
     for i, job in enumerate(jobs, 1):
         print(f"[{i}/{len(jobs)}] run: {job}")
         
@@ -2887,30 +3099,33 @@ if __name__ == "__main__":
             rec = run_job(job, args.model_id, args.out_dir, args)
             if args.model_family == "esm2":
                 print(
-                    "[ok] ppl_s2=", rec.get("ppl_s2"),
-                    "| Δ=", rec.get("delta_ppl_s2"),
-                    "| long_range_full=", rec.get("long_range_pl", {}).get("full_test_s2"),
-                    "| long_range_fixed=", rec.get("long_range_pl", {}).get("fixed_500_s2"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
                 print(
-                    "[eval-summary] long_range_full:",
-                    rec.get("eval_stats", {}).get("long_range_full_s2"),
+                    "[eval-summary] regression:",
+                    rec.get("eval_stats", {}).get("s2"),
                     flush=True,
                 )
             else:
                 print(
-                    "[ok] ppl_s2=", rec.get("ppl_s2"),
-                    "| Δ=", rec.get("delta_ppl_s2"),
-                    "| val_ppl=", rec.get("val_ppl"),
-                    "| val_Δ=", rec.get("delta_val_ppl"),
+                    "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
+                    "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
         except RuntimeError as e:
+            had_error = True
             print("[fail][RuntimeError]", e)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
         except Exception as e:
+            had_error = True
             if _is_hf_network_error(e):
                 print("[info] Hugging Face network error ignored:", e)
                 continue
             print("[fail]", e)
+
+    if had_error:
+        sys.exit(1)
