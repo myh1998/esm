@@ -11,6 +11,7 @@ E) PPL评估优化：确保模型在正确状态下评估，避免训练状态�
 """
 
 import os, json, time, math, argparse, gc, csv, sys
+import hashlib
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -1872,6 +1873,33 @@ def save_esm_regression_checkpoint(model, head, out_dir, meta):
     return str(ckpt)
 
 
+def load_esm_regression_checkpoint(head, ckpt_path):
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.exists():
+        return False, {}
+    payload = torch.load(str(ckpt_path), map_location="cpu")
+    state = payload.get("head_state", payload)
+    head.load_state_dict(state, strict=True)
+    return True, payload.get("meta", {})
+
+
+def _head_warmstart_key(args):
+    key_obj = {
+        "esm_model_name": str(args.esm_model_name),
+        "hf_dataset_id": str(args.hf_dataset_id),
+        "label_field": str(args.label_field),
+        "sequence_field": str(args.sequence_field),
+        "split_column": str(args.hf_split_column),
+        "split_seed": int(args.hf_split_seed),
+        "reg_loss": str(args.reg_loss),
+        "seq_len": int(args.seq_len),
+        "s1_steps": int(args.s1_steps),
+        "s1_lr": float(args.s1_lr),
+    }
+    raw = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 def train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, cfg: FTConfig, args):
     device = next(model.parameters()).device
     model.train(); head.train()
@@ -2096,6 +2124,14 @@ def run_job_esm(job, out_dir, args):
 
     hidden_dim = int(getattr(model, "embed_dim", getattr(getattr(model, "args", None), "embed_dim", 1280)))
     head = ESMRegressionHead(hidden_dim).to(next(model.parameters()).device)
+    warmstart_dir = Path(out_dir) / "head_warmstart"
+    warmstart_dir.mkdir(parents=True, exist_ok=True)
+    warmstart_path = warmstart_dir / f"head_{_head_warmstart_key(args)}.pt"
+    head_loaded, head_loaded_meta = (False, {})
+    if str(getattr(args, "head_warmstart_mode", "auto")).lower() == "auto":
+        head_loaded, head_loaded_meta = load_esm_regression_checkpoint(head, warmstart_path)
+        if head_loaded:
+            print(f"[info] loaded head warmstart: {warmstart_path}", flush=True)
 
     gate_records = val_records
     final_test_records = test_records
@@ -2129,26 +2165,31 @@ def run_job_esm(job, out_dir, args):
         baseline_cache[baseline_key] = {"base_metrics": base_metrics, "base_stats": base_stats}
         _write_esm_baseline_cache(baseline_cache_path, baseline_cache)
 
-    ft1 = FTConfig(
-        steps=args.s1_steps,
-        lr=args.s1_lr,
-        warmup_ratio=args.s1_warmup_ratio,
-        seq_len=args.seq_len,
-        batch_size=args.bs,
-        grad_accum=args.ga,
-        eval_every=args.eval_every,
-        early_stop_patience=args.es_patience,
-        early_stop_delta=args.es_delta,
-    )
-    t_s1_train = _tlog_start("stage1_train")
-    ft1_log = train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, ft1, args)
-    _tlog_end("stage1_train", t_s1_train)
+    if head_loaded and rank == 0:
+        print("[info] rank=0 baseline warmstart hit: skip S1/S2 training", flush=True)
+        ft1_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+        s1_metrics, s1_stats = dict(base_metrics), dict(base_stats)
+    else:
+        ft1 = FTConfig(
+            steps=args.s1_steps,
+            lr=args.s1_lr,
+            warmup_ratio=args.s1_warmup_ratio,
+            seq_len=args.seq_len,
+            batch_size=args.bs,
+            grad_accum=args.ga,
+            eval_every=args.eval_every,
+            early_stop_patience=args.es_patience,
+            early_stop_delta=args.es_delta,
+        )
+        t_s1_train = _tlog_start("stage1_train")
+        ft1_log = train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, ft1, args)
+        _tlog_end("stage1_train", t_s1_train)
 
-    s1_metrics, s1_stats = eval_esm_regression(
-        model, head, gate_records, alphabet, batch_converter,
-        batch_size=_eval_bs(args),
-        max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
-    )
+        s1_metrics, s1_stats = eval_esm_regression(
+            model, head, gate_records, alphabet, batch_converter,
+            batch_size=_eval_bs(args),
+            max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
+        )
 
     base_sp = float(base_metrics.get("spearman", float("nan")))
     s1_sp = float(s1_metrics.get("spearman", float("nan")))
@@ -2157,7 +2198,7 @@ def run_job_esm(job, out_dir, args):
     ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
     s2_metrics, s2_stats = dict(s1_metrics), dict(s1_stats)
 
-    if go_s2 and args.s2_steps > 0:
+    if (not (head_loaded and rank == 0)) and go_s2 and args.s2_steps > 0:
         ft2 = FTConfig(
             steps=args.s2_steps,
             lr=args.s2_lr,
@@ -2184,6 +2225,23 @@ def run_job_esm(job, out_dir, args):
         batch_size=_eval_bs(args),
         max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
     )
+
+    if (not head_loaded) and rank == 0 and str(getattr(args, "head_warmstart_mode", "auto")).lower() == "auto":
+        save_esm_regression_checkpoint(
+            model, head, warmstart_dir,
+            meta={
+                "kind": "baseline_head_warmstart",
+                "path": str(warmstart_path),
+                "esm_model_name": str(args.esm_model_name),
+                "hf_dataset_id": str(args.hf_dataset_id),
+                "label_field": str(args.label_field),
+                "sequence_field": str(args.sequence_field),
+                "split_column": str(args.hf_split_column),
+            },
+        )
+        # 统一文件名保存，避免 save_esm_regression_checkpoint 的固定命名覆盖旧逻辑
+        (warmstart_dir / "esm_regression_checkpoint.pt").replace(warmstart_path)
+        print(f"[info] saved head warmstart: {warmstart_path}", flush=True)
 
     ckpt_path = save_esm_regression_checkpoint(
         model, head, Path(out_dir) / "checkpoints",
@@ -2254,6 +2312,10 @@ def run_job_esm(job, out_dir, args):
             "pooling": "mean",
             "hidden_dim": hidden_dim,
             "checkpoint": ckpt_path,
+            "warmstart_mode": str(getattr(args, "head_warmstart_mode", "auto")),
+            "warmstart_path": str(warmstart_path),
+            "warmstart_loaded": bool(head_loaded),
+            "warmstart_loaded_meta": head_loaded_meta,
         },
         "s1_log": ft1_log,
         "s2_log": ft2_log,
@@ -2685,6 +2747,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_eval_bs", type=int, default=1)
+    ap.add_argument("--head_warmstart_mode", type=str, default="auto", choices=["off", "auto"])
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2897,6 +2960,7 @@ if __name__ == "__main__":
     ap.add_argument("--hf_split_seed", type=int, default=42)
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_eval_bs", type=int, default=1)
+    ap.add_argument("--head_warmstart_mode", type=str, default="auto", choices=["off", "auto"])
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
