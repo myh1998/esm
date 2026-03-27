@@ -2146,9 +2146,12 @@ def run_job_esm(job, out_dir, args):
         "esm_eval_max_items": int(args.esm_eval_max_items),
         "esm_eval_bs": _eval_bs(args),
         "bs": int(args.bs),
+        "head_warmstart_mode": str(getattr(args, "head_warmstart_mode", "auto")),
+        "head_warmstart_path": str(warmstart_path),
+        "head_warmstart_loaded": bool(head_loaded),
     }, sort_keys=True, ensure_ascii=False)
     baseline_cache = _read_esm_baseline_cache(baseline_cache_path)
-    cached_base = baseline_cache.get(baseline_key) if rank > 0 else None
+    cached_base = baseline_cache.get(baseline_key)
 
     if cached_base is not None:
         print("[info] using cached ESM regression validation-gate baseline metrics")
@@ -2220,11 +2223,34 @@ def run_job_esm(job, out_dir, args):
             max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
         )
 
-    final_metrics, final_stats = eval_esm_regression(
-        model, head, final_test_records, alphabet, batch_converter,
-        batch_size=_eval_bs(args),
-        max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
-    )
+    final_eval_cache_path = Path(out_dir) / "esm_regression_final_eval_cache.json"
+    final_eval_cache = _read_esm_baseline_cache(final_eval_cache_path)
+    final_eval_key = json.dumps({
+        "baseline_key": baseline_key,
+        "rank": int(rank),
+        "target_modules": target_modules,
+        "layer_filter": layer_filter,
+        "s1_steps": int(args.s1_steps),
+        "s2_steps": int(args.s2_steps),
+    }, sort_keys=True, ensure_ascii=False)
+
+    if head_loaded and rank == 0 and final_eval_key in final_eval_cache:
+        cached_final = final_eval_cache[final_eval_key]
+        final_metrics = cached_final.get("final_metrics", {})
+        final_stats = cached_final.get("final_stats", {"cached": True})
+        print("[info] using cached final test metrics for rank=0 warmstart baseline", flush=True)
+    else:
+        final_metrics, final_stats = eval_esm_regression(
+            model, head, final_test_records, alphabet, batch_converter,
+            batch_size=_eval_bs(args),
+            max_eval=args.esm_eval_max_items if args.esm_eval_max_items > 0 else None,
+        )
+        if head_loaded and rank == 0:
+            final_eval_cache[final_eval_key] = {
+                "final_metrics": final_metrics,
+                "final_stats": final_stats,
+            }
+            _write_esm_baseline_cache(final_eval_cache_path, final_eval_cache)
 
     if (not head_loaded) and rank == 0 and str(getattr(args, "head_warmstart_mode", "auto")).lower() == "auto":
         save_esm_regression_checkpoint(
@@ -2848,7 +2874,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     # Qwen/Qwen2.5-1.5B / meta-llama/Llama-3.1-8B
     if args.model_id == 'Qwen/Qwen2.5-1.5B':
         args.s2_steps = 1000
-    elif args.model_id == 'meta-llama/Llama-3.1-8B':
+    elif args.model_family != "esm2" and args.model_id == 'meta-llama/Llama-3.1-8B':
         # args.s1_steps = 30
         # args.s2_steps = 400
         # args.seq_len = 256
@@ -3071,7 +3097,7 @@ if __name__ == "__main__":
     
     print(f"[info] global_task_type = {global_task_type}", flush=True)
 
-    if args.model_id == "meta-llama/Llama-3.1-8B":
+    if args.model_family != "esm2" and args.model_id == "meta-llama/Llama-3.1-8B":
         # args.s1_steps = 30
         # args.s2_steps = 400
         # args.seq_len = 256
