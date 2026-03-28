@@ -1895,9 +1895,23 @@ def _head_warmstart_key(args):
         "seq_len": int(args.seq_len),
         "s1_steps": int(args.s1_steps),
         "s1_lr": float(args.s1_lr),
+        "s1_warmup_ratio": float(args.s1_warmup_ratio),
+        "s2_steps": int(args.s2_steps),
+        "s2_lr": float(args.s2_lr),
+        "s2_warmup_ratio": float(args.s2_warmup_ratio),
+        "s2_gate_delta": float(args.s2_gate_delta),
+        "bs": int(args.bs),
+        "ga": int(args.ga),
     }
     raw = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _resolve_head_warmstart_load_path(args, default_warmstart_path):
+    override = str(getattr(args, "head_warmstart_from", "") or "").strip()
+    if override == "":
+        return Path(default_warmstart_path)
+    return Path(override).expanduser()
 
 
 def train_lora_esm_regression(model, head, alphabet, batch_converter, train_records, val_records, cfg: FTConfig, args):
@@ -2127,11 +2141,12 @@ def run_job_esm(job, out_dir, args):
     warmstart_dir = Path(out_dir) / "head_warmstart"
     warmstart_dir.mkdir(parents=True, exist_ok=True)
     warmstart_path = warmstart_dir / f"head_{_head_warmstart_key(args)}.pt"
+    warmstart_load_path = _resolve_head_warmstart_load_path(args, warmstart_path)
     head_loaded, head_loaded_meta = (False, {})
     if str(getattr(args, "head_warmstart_mode", "auto")).lower() == "auto":
-        head_loaded, head_loaded_meta = load_esm_regression_checkpoint(head, warmstart_path)
+        head_loaded, head_loaded_meta = load_esm_regression_checkpoint(head, warmstart_load_path)
         if head_loaded:
-            print(f"[info] loaded head warmstart: {warmstart_path}", flush=True)
+            print(f"[info] loaded head warmstart: {warmstart_load_path}", flush=True)
 
     gate_records = val_records
     final_test_records = test_records
@@ -2147,7 +2162,7 @@ def run_job_esm(job, out_dir, args):
         "esm_eval_bs": _eval_bs(args),
         "bs": int(args.bs),
         "head_warmstart_mode": str(getattr(args, "head_warmstart_mode", "auto")),
-        "head_warmstart_path": str(warmstart_path),
+        "head_warmstart_path": str(warmstart_load_path),
         "head_warmstart_loaded": bool(head_loaded),
     }, sort_keys=True, ensure_ascii=False)
     baseline_cache = _read_esm_baseline_cache(baseline_cache_path)
@@ -2258,6 +2273,7 @@ def run_job_esm(job, out_dir, args):
             meta={
                 "kind": "baseline_head_warmstart",
                 "path": str(warmstart_path),
+                "loaded_from": str(warmstart_load_path),
                 "esm_model_name": str(args.esm_model_name),
                 "hf_dataset_id": str(args.hf_dataset_id),
                 "label_field": str(args.label_field),
@@ -2774,6 +2790,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_eval_bs", type=int, default=1)
     ap.add_argument("--head_warmstart_mode", type=str, default="auto", choices=["off", "auto"])
+    ap.add_argument("--head_warmstart_from", type=str, default="")
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
@@ -2987,6 +3004,7 @@ if __name__ == "__main__":
     ap.add_argument("--esm_eval_max_items", type=int, default=512)
     ap.add_argument("--esm_eval_bs", type=int, default=1)
     ap.add_argument("--head_warmstart_mode", type=str, default="auto", choices=["off", "auto"])
+    ap.add_argument("--head_warmstart_from", type=str, default="")
     ap.add_argument("--esm_rank", type=int, default=8)
     ap.add_argument(
         "--esm_target_modules",
