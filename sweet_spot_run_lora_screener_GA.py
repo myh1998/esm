@@ -2885,10 +2885,12 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     # Stage 1
     ap.add_argument("--s1_steps", type=int, default=100)
     ap.add_argument("--s1_lr", type=float, default=1e-4)
+    ap.add_argument("--s1_warmup_ratio", type=float, default=0.10)
 
     # Stage 2
     ap.add_argument("--s2_steps", type=int, default=1000)
     ap.add_argument("--s2_lr", type=float, default=8e-5)
+    ap.add_argument("--s2_warmup_ratio", type=float, default=0.10)
     ap.add_argument("--s2_gate_delta", type=float, default=0.005, help="进入S2的门槛：spearman_s1 - spearman_base >= gate")
 
     # 训练 & 早停 & 批配置
@@ -2942,8 +2944,22 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--SEED", type=int, default=42)
 
     ap.add_argument('--MODEL_ID', type=str, default='Qwen/Qwen2.5-1.5B')
+    ap.add_argument("--fast_debug", action="store_true")
+    ap.add_argument(
+        "--esm_30gb_stable_profile",
+        action="store_true",
+        help="启用 30GB 显存稳定配置（更保守的 seq_len/lr/warmup/eval）",
+    )
     
     args = ap.parse_args()
+
+    if args.fast_debug:
+        args.esm_eval_max_items = min(args.esm_eval_max_items, 20)
+        args.s1_steps = 0
+        args.s2_steps = 0
+        print("[info] fast_debug enabled: using reduced ESM eval sizes", flush=True)
+
+    args = _apply_esm_30gb_profile(args)
 
     if model_id is not None:
         args.model_id = model_id
@@ -2952,8 +2968,6 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         global_task_type = TaskType.FEATURE_EXTRACTION
     else:
         global_task_type = TaskType.CAUSAL_LM
-    
-    print(f"[info] global_task_type = {global_task_type}", flush=True)
 
     # Qwen/Qwen2.5-1.5B / meta-llama/Llama-3.1-8B
     if args.model_id == 'Qwen/Qwen2.5-1.5B':
@@ -2997,6 +3011,12 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         args.seq_len = 256
         args.eval_every = 800
         args.head_warmstart_from = 'runs/esm_fluorescence_smoke/head_warmstart/head_e995af1218d2b599f9f4c132381e568e.pt'
+
+    if args.model_family == "esm2":
+        global_task_type = TaskType.FEATURE_EXTRACTION
+    else:
+        global_task_type = TaskType.CAUSAL_LM
+    print(f"[info] global_task_type = {global_task_type}", flush=True)
     with open(configs_path) as f:
         jobs = json.load(f)
     if args.max_items and args.max_items > 0:
