@@ -1886,7 +1886,7 @@ def eval_esm_regression(model, head, records, alphabet, batch_converter, batch_s
         "skipped_oom": 0,
     }
     if len(records) == 0:
-        return {"spearman": float("nan"), "pearson": float("nan"), "rmse": float("nan"), "mae": float("nan")}, stats
+        return {"spearman": float("nan"), "pearson": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mae": float("nan")}, stats
 
     model.eval(); head.eval()
     device = next(model.parameters()).device
@@ -1914,15 +1914,36 @@ def eval_esm_regression(model, head, records, alphabet, batch_converter, batch_s
         stats["evaluated"] += len(chunk)
 
     if len(ys) == 0:
-        return {"spearman": float("nan"), "pearson": float("nan"), "rmse": float("nan"), "mae": float("nan")}, stats
+        return {"spearman": float("nan"), "pearson": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mae": float("nan")}, stats
 
     y = np.asarray(ys, dtype=np.float64)
     p = np.asarray(ps, dtype=np.float64)
     sp = float(spearmanr(y, p).correlation)
     pr = float(pearsonr(y, p)[0]) if len(y) > 1 else float("nan")
-    rmse = float(np.sqrt(np.mean((p - y) ** 2)))
+    mse = float(np.mean((p - y) ** 2))
+    rmse = float(np.sqrt(mse))
     mae = float(np.mean(np.abs(p - y)))
-    return {"spearman": sp, "pearson": pr, "rmse": rmse, "mae": mae}, stats
+    return {"spearman": sp, "pearson": pr, "mse": mse, "rmse": rmse, "mae": mae}, stats
+
+
+def _obj_b_from_spearman(sp):
+    try:
+        v = float(sp)
+    except Exception:
+        return float("nan")
+    if np.isnan(v):
+        return float("nan")
+    return 1.0 - v
+
+
+def _obj_c_from_mse(mse, eps=1e-12):
+    try:
+        v = float(mse)
+    except Exception:
+        return float("nan")
+    if np.isnan(v):
+        return float("nan")
+    return float(np.log(max(v, 0.0) + float(eps)))
 
 
 def _eval_bs(args):
@@ -1992,7 +2013,14 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
 
     params = [p for _, p in model.named_parameters() if p.requires_grad] + [p for p in head.parameters() if p.requires_grad]
     if (not has_lora) and len([p for p in head.parameters() if p.requires_grad]) == 0:
-        return {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+        return {
+            "train_loss_traj": [],
+            "steps_done": 0,
+            "eval_spearman_per_step": [],
+            "eval_rmse_per_step": [],
+            "eval_b_per_step": [],
+            "eval_c_per_step": [],
+        }
 
     opt = AdamW(params, lr=cfg.lr)
     from transformers import get_linear_schedule_with_warmup
@@ -2001,7 +2029,7 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
     sch = get_linear_schedule_with_warmup(opt, warmup, total_steps)
     crit = nn.MSELoss() if str(getattr(args, "reg_loss", "mse")).lower() == "mse" else nn.HuberLoss(delta=1.0)
 
-    hist, hist_sp, hist_rmse = [], [], []
+    hist, hist_sp, hist_rmse, hist_b, hist_c = [], [], [], [], []
     best = float("inf")
     no_improve = 0
 
@@ -2038,15 +2066,31 @@ def train_lora_esm_regression(model, head, alphabet, batch_converter, train_reco
             )
             sp = float(metrics.get("spearman", float("nan")))
             rmse = float(metrics.get("rmse", float("nan")))
+            mse = float(metrics.get("mse", rmse * rmse))
+            b_obj = _obj_b_from_spearman(sp)
+            c_obj = _obj_c_from_mse(mse, eps=float(getattr(args, "obj_mse_eps", 1e-12)))
             hist_sp.append(sp)
             hist_rmse.append(rmse)
-            print(f"[ESM-REG] step {step}/{cfg.steps} | train_loss={l:.4f} | eval_spearman={sp:.4f}", flush=True)
+            hist_b.append(b_obj)
+            hist_c.append(c_obj)
+            print(
+                f"[ESM-REG] step {step}/{cfg.steps} | train_loss={l:.4f} "
+                f"| eval_spearman={sp:.4f} | B=(1-rho)={b_obj:.4f} | C=log(mse+eps)={c_obj:.4f}",
+                flush=True,
+            )
 
         if no_improve >= cfg.early_stop_patience:
             print(f"[ESM-REG early-stop] no improvement {no_improve} steps", flush=True)
             break
 
-    return {"train_loss_traj": hist, "steps_done": len(hist), "eval_spearman_per_step": hist_sp, "eval_rmse_per_step": hist_rmse}
+    return {
+        "train_loss_traj": hist,
+        "steps_done": len(hist),
+        "eval_spearman_per_step": hist_sp,
+        "eval_rmse_per_step": hist_rmse,
+        "eval_b_per_step": hist_b,
+        "eval_c_per_step": hist_c,
+    }
 
 
 def _apply_esm_30gb_profile(args):
@@ -2133,6 +2177,31 @@ def _write_esm_baseline_cache(cache_path, payload):
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with cache_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def clear_esm_regression_caches(out_dir, clear_mode="none"):
+    mode = str(clear_mode or "none").lower()
+    if mode in ("", "none", "off"):
+        return []
+    out_dir = Path(out_dir)
+    removed = []
+
+    def _rm_file(p: Path):
+        if p.exists() and p.is_file():
+            p.unlink()
+            removed.append(str(p))
+
+    if mode in ("baseline", "all"):
+        _rm_file(out_dir / "esm_regression_baseline_cache_val_gate.json")
+    if mode in ("final", "all"):
+        _rm_file(out_dir / "esm_regression_final_eval_cache.json")
+    if mode in ("warmstart", "all"):
+        warm_dir = out_dir / "head_warmstart"
+        if warm_dir.exists() and warm_dir.is_dir():
+            for p in warm_dir.glob("*.pt"):
+                p.unlink()
+                removed.append(str(p))
+    return removed
 
 
 def _make_esm_baseline_cache_key(args, seed, split_manifest, subset_manifest, eval_modes):
@@ -2253,7 +2322,7 @@ def run_job_esm(job, out_dir, args):
 
     if head_loaded and rank == 0:
         print("[info] rank=0 baseline warmstart hit: skip S1/S2 training", flush=True)
-        ft1_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+        ft1_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": [], "eval_b_per_step": [], "eval_c_per_step": []}
         s1_metrics, s1_stats = dict(base_metrics), dict(base_stats)
     else:
         ft1 = FTConfig(
@@ -2281,7 +2350,7 @@ def run_job_esm(job, out_dir, args):
     s1_sp = float(s1_metrics.get("spearman", float("nan")))
     go_s2 = (s1_sp - base_sp) >= float(args.s2_gate_delta) if args.s2_gate_delta is not None else True
 
-    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": []}
+    ft2_log = {"train_loss_traj": [], "steps_done": 0, "eval_spearman_per_step": [], "eval_rmse_per_step": [], "eval_b_per_step": [], "eval_c_per_step": []}
     s2_metrics, s2_stats = dict(s1_metrics), dict(s1_stats)
 
     if (not (head_loaded and rank == 0)) and go_s2 and args.s2_steps > 0:
@@ -2375,6 +2444,15 @@ def run_job_esm(job, out_dir, args):
 
     best_spearman_ft = max(s1_sp_hist + s2_sp_hist) if (len(s1_sp_hist) + len(s2_sp_hist)) > 0 else float(s2_metrics.get("spearman", float("nan")))
     best_rmse_ft = min(s1_rmse_hist + s2_rmse_hist) if (len(s1_rmse_hist) + len(s2_rmse_hist)) > 0 else float(s2_metrics.get("rmse", float("nan")))
+    best_mse_ft = best_rmse_ft * best_rmse_ft if not np.isnan(best_rmse_ft) else float("nan")
+    b_base = _obj_b_from_spearman(_m(base_metrics, "spearman"))
+    b_s1 = _obj_b_from_spearman(_m(s1_metrics, "spearman"))
+    b_s2 = _obj_b_from_spearman(_m(s2_metrics, "spearman"))
+    b_best_ft = _obj_b_from_spearman(best_spearman_ft)
+    c_base = _obj_c_from_mse(_m(base_metrics, "mse"), eps=float(getattr(args, "obj_mse_eps", 1e-12)))
+    c_s1 = _obj_c_from_mse(_m(s1_metrics, "mse"), eps=float(getattr(args, "obj_mse_eps", 1e-12)))
+    c_s2 = _obj_c_from_mse(_m(s2_metrics, "mse"), eps=float(getattr(args, "obj_mse_eps", 1e-12)))
+    c_best_ft = _obj_c_from_mse(best_mse_ft, eps=float(getattr(args, "obj_mse_eps", 1e-12)))
 
     rec = {
         **job,
@@ -2406,6 +2484,11 @@ def run_job_esm(job, out_dir, args):
         "rmse_s2": _m(s2_metrics, "rmse"),
         "rmse_s2_best_ft": best_rmse_ft,
         "rmse_test_final": _m(final_metrics, "rmse"),
+        "mse_base": _m(base_metrics, "mse"),
+        "mse_s1": _m(s1_metrics, "mse"),
+        "mse_s2": _m(s2_metrics, "mse"),
+        "mse_s2_best_ft": best_mse_ft,
+        "mse_test_final": _m(final_metrics, "mse"),
         "mae_base": _m(base_metrics, "mae"),
         "mae_s1": _m(s1_metrics, "mae"),
         "mae_s2": _m(s2_metrics, "mae"),
@@ -2414,10 +2497,18 @@ def run_job_esm(job, out_dir, args):
         "pearson_s1": _m(s1_metrics, "pearson"),
         "pearson_s2": _m(s2_metrics, "pearson"),
         "pearson_test_final": _m(final_metrics, "pearson"),
+        "obj_b_base": b_base,
+        "obj_b_s1": b_s1,
+        "obj_b_s2": b_s2,
+        "obj_b_s2_best_ft": b_best_ft,
+        "obj_c_base": c_base,
+        "obj_c_s1": c_s1,
+        "obj_c_s2": c_s2,
+        "obj_c_s2_best_ft": c_best_ft,
         "gate_delta": float(args.s2_gate_delta),
         "go_s2": bool(go_s2),
-        "nas_obj": 1.0 - _m(s2_metrics, "spearman"),
-        "nas_obj_best_ft": 1.0 - best_spearman_ft,
+        "nas_obj": b_s2,
+        "nas_obj_best_ft": b_best_ft,
         "regression_head": {
             "pooling": "mean",
             "hidden_dim": hidden_dim,
@@ -2890,7 +2981,6 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     # Stage 2
     ap.add_argument("--s2_steps", type=int, default=1000)
     ap.add_argument("--s2_lr", type=float, default=8e-5)
-    ap.add_argument("--s2_warmup_ratio", type=float, default=0.10)
     ap.add_argument("--s2_gate_delta", type=float, default=0.005, help="进入S2的门槛：spearman_s1 - spearman_base >= gate")
 
     # 训练 & 早停 & 批配置
@@ -2905,6 +2995,8 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--ga_bs", type=int, default=2, help="LoRA-GA 梯度估计的batch size")
     ap.add_argument("--ga_samples", type=int, default=16, help="用于估计梯度的样本数上限")
     ap.add_argument("--reg_loss", type=str, default="mse", choices=["mse", "huber"], help="回归损失函数")
+    ap.add_argument("--obj_mse_eps", type=float, default=1e-12, help="C目标中的数值稳定项：log(mse + eps)")
+    ap.add_argument("--esm_cache_clear", type=str, default="none", choices=["none", "baseline", "final", "warmstart", "all"], help="运行前清理ESM回归缓存")
 
     # 任务采样
     ap.add_argument("--max_items", type=int, default=1)
@@ -3012,11 +3104,12 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         args.eval_every = 800
         args.head_warmstart_from = 'runs/esm_fluorescence_smoke/head_warmstart/head_e995af1218d2b599f9f4c132381e568e.pt'
 
-    if args.model_family == "esm2":
-        global_task_type = TaskType.FEATURE_EXTRACTION
-    else:
-        global_task_type = TaskType.CAUSAL_LM
-    print(f"[info] global_task_type = {global_task_type}", flush=True)
+    cleared = clear_esm_regression_caches(args.out_dir, getattr(args, "esm_cache_clear", "none"))
+    if len(cleared) > 0:
+        print(f"[info] cleared ESM regression caches ({len(cleared)}):")
+        for p in cleared:
+            print(f"  - {p}")
+
     with open(configs_path) as f:
         jobs = json.load(f)
     if args.max_items and args.max_items > 0:
@@ -3053,6 +3146,8 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
                 print(
                     "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
                     "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| obj_B(best-ft)=", rec.get("obj_b_s2_best_ft"),
+                    "| obj_C(best-ft)=", rec.get("obj_c_s2_best_ft"),
                     "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
                 print(
@@ -3064,6 +3159,8 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
                 print(
                     "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
                     "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| obj_B(best-ft)=", rec.get("obj_b_s2_best_ft"),
+                    "| obj_C(best-ft)=", rec.get("obj_c_s2_best_ft"),
                     "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
         except RuntimeError as e:
@@ -3089,19 +3186,6 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     print(f"\033[1;31m[ Time used: --------------------------------------------------- {time.time() - start_time} --------------------------------------------------- ]\033[0m")
 
     if args.model_family == "esm2":
-        print(
-            "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
-            "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
-            "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
-        )
-        print(
-            "[eval-summary] regression:",
-            rec.get("eval_stats", {}).get("s2"),
-            flush=True,
-        )
-
-        exit()
-
         return rec.get("spearman_s2_best_ft"), rec.get("nas_obj_best_ft")
     return rec.get("val_ppl"), rec.get("delta_val_ppl")
 
@@ -3176,6 +3260,8 @@ if __name__ == "__main__":
     ap.add_argument("--ga_bs", type=int, default=1, help="LoRA-GA 梯度估计的batch size")
     ap.add_argument("--ga_samples", type=int, default=16, help="用于估计梯度的样本数上限")
     ap.add_argument("--reg_loss", type=str, default="mse", choices=["mse", "huber"], help="回归损失函数")
+    ap.add_argument("--obj_mse_eps", type=float, default=1e-12, help="C目标中的数值稳定项：log(mse + eps)")
+    ap.add_argument("--esm_cache_clear", type=str, default="none", choices=["none", "baseline", "final", "warmstart", "all"], help="运行前清理ESM回归缓存")
 
     # 任务采样
     ap.add_argument("--max_items", type=int, default=0)
@@ -3251,6 +3337,12 @@ if __name__ == "__main__":
         # args.s1_lr = 2e-4
         # args.s2_lr = 1e-4
         args.s2_steps = 300
+
+    cleared = clear_esm_regression_caches(args.out_dir, getattr(args, "esm_cache_clear", "none"))
+    if len(cleared) > 0:
+        print(f"[info] cleared ESM regression caches ({len(cleared)}):")
+        for p in cleared:
+            print(f"  - {p}")
 
     with open(args.configs_path) as f:
         jobs = json.load(f)
