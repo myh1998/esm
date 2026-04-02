@@ -3110,6 +3110,12 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         for p in cleared:
             print(f"  - {p}")
 
+    cleared = clear_esm_regression_caches(args.out_dir, getattr(args, "esm_cache_clear", "none"))
+    if len(cleared) > 0:
+        print(f"[info] cleared ESM regression caches ({len(cleared)}):")
+        for p in cleared:
+            print(f"  - {p}")
+
     with open(configs_path) as f:
         jobs = json.load(f)
     if args.max_items and args.max_items > 0:
@@ -3361,6 +3367,8 @@ if __name__ == "__main__":
                 print(
                     "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
                     "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| obj_B(best-ft)=", rec.get("obj_b_s2_best_ft"),
+                    "| obj_C(best-ft)=", rec.get("obj_c_s2_best_ft"),
                     "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
                 print(
@@ -3372,6 +3380,8 @@ if __name__ == "__main__":
                 print(
                     "[ok] spearman_s2(best-ft)=", rec.get("spearman_s2_best_ft"),
                     "| rmse_s2(best-ft)=", rec.get("rmse_s2_best_ft"),
+                    "| obj_B(best-ft)=", rec.get("obj_b_s2_best_ft"),
+                    "| obj_C(best-ft)=", rec.get("obj_c_s2_best_ft"),
                     "| nas_obj(best-ft)=", rec.get("nas_obj_best_ft"),
                 )
         except RuntimeError as e:
