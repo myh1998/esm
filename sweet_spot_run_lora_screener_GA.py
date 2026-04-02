@@ -238,21 +238,89 @@ def load_llm(model_id, dtype=torch.float16, force_cuda0=False):
         model.config.use_cache = False
     return model, tok
 
-def select_targets(model, layer_idx, pos_names):
-    targets = []
+# def select_targets(model, layer_idx, pos_names):
+#     targets = []
+POS_COMBO_MAP = {
+    "__combo_attn_all__": ["q_proj", "k_proj", "v_proj", "out_proj"],
+    "__combo_attn_core__": ["q_proj", "v_proj"],
+    "__combo_kv_pair__": ["k_proj", "v_proj"],
+    "__combo_mlp_only__": ["fc1", "fc2"],
+    "__combo_out_fc2__": ["out_proj", "fc2"],
+    "__combo_full_mix__": ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+    "self_attn.qv_pair": ["q_proj", "v_proj"],  # backward compatibility
+}
+
+LAYER_COMBO_MAP = {
+    36: [30, 31, 32, 33, 34, 35],
+    37: [18, 20, 22, 24, 26, 28, 30, 32, 34],
+    38: [12, 24, 35],
+    39: list(range(36)),
+    40: [0, 1, 2, 3, 4, 5],
+    41: [14, 15, 16, 17, 18, 19],
+    42: [4, 5, 6, 16, 17, 18, 30, 31, 32],
+    43: [0, 1, 2, 33, 34, 35],
+    44: [20, 22, 24, 26, 28, 30, 32, 34],
+}
+
+POS_ALIAS_PATTERNS = {
+    "q_proj": ["q_proj", "self.query", ".query"],
+    "k_proj": ["k_proj", "self.key", ".key"],
+    "v_proj": ["v_proj", "self.value", ".value"],
+    "out_proj": ["out_proj", "o_proj", "attention.output.dense", "self_attn.o_proj"],
+    "fc1": ["fc1", "gate_proj", "up_proj", "intermediate.dense"],
+    "fc2": ["fc2", "down_proj", "output.dense"],
+}
+
+
+def _expand_pos_names(pos_names):
+    expanded = []    
     for pos in pos_names:
-        if pos == "self_attn.qv_pair":
-            targets += [
-                f"model.layers.{layer_idx}.self_attn.q_proj",
-                f"model.layers.{layer_idx}.self_attn.v_proj",
-            ]
+        if pos in POS_COMBO_MAP:
+            expanded.extend(POS_COMBO_MAP[pos])
         else:
-            targets.append(f"model.layers.{layer_idx}.{pos}")
+            expanded.append(pos)
+    # keep order, remove duplicates
+    return list(dict.fromkeys(expanded))
+
+
+def _expand_layers(layer_idx):
+    layer_idx = int(layer_idx)
+    return LAYER_COMBO_MAP.get(layer_idx, [layer_idx])
+
+
+def _match_targets_by_suffix(named_keys, layer_idx, pos_name):
+    hits = []
+    layer_pat = f".{layer_idx}."
+    alias = POS_ALIAS_PATTERNS.get(pos_name, [pos_name])
+    for key in named_keys:
+        if layer_pat not in key:
+            continue
+        if any(pat in key for pat in alias):
+            hits.append(key)
+    return hits
+
+
+def select_targets(model, layer_idx, pos_names):
     named = dict(model.named_modules())
-    valid = [t for t in targets if t in named]
-    if len(valid) < len(targets):
-        missing = sorted(list(set(targets) - set(valid)))
-        print(f"[warn] missing modules skipped: {missing}")
+    named_keys = list(named.keys())
+    all_targets = []
+
+    expanded_pos = _expand_pos_names(pos_names)
+    expanded_layers = _expand_layers(layer_idx)
+
+    for lid in expanded_layers:
+        for pos in expanded_pos:
+            # 1) fast-path: old canonical layout
+            canonical = f"model.layers.{lid}.{pos}"
+            if canonical in named:
+                all_targets.append(canonical)
+                continue
+            # 2) fuzzy matching for different backbones (e.g., ESM2/BERT-like names)
+            all_targets.extend(_match_targets_by_suffix(named_keys, lid, pos))
+
+    valid = list(dict.fromkeys(all_targets))
+    if not valid:
+        print(f"[warn] no target modules found for layer={layer_idx}, pos={pos_names}")
     return valid
 
 def build_peft(model, target_modules, r):
@@ -2853,7 +2921,6 @@ def run_job(job, base_model_id, out_dir, args):
     return rec
 
 def make_lora_ft(cfg_path, model_id=None, out_dir=None):
-    
     start_time = time.time()
 
     here = Path(__file__).resolve().parent
@@ -2909,6 +2976,7 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     # Stage 1
     ap.add_argument("--s1_steps", type=int, default=100)
     ap.add_argument("--s1_lr", type=float, default=1e-4)
+    ap.add_argument("--s1_warmup_ratio", type=float, default=0.10)
 
     # Stage 2
     ap.add_argument("--s2_steps", type=int, default=1000)
@@ -2968,8 +3036,22 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
     ap.add_argument("--SEED", type=int, default=42)
 
     ap.add_argument('--MODEL_ID', type=str, default='Qwen/Qwen2.5-1.5B')
+    ap.add_argument("--fast_debug", action="store_true")
+    ap.add_argument(
+        "--esm_30gb_stable_profile",
+        action="store_true",
+        help="启用 30GB 显存稳定配置（更保守的 seq_len/lr/warmup/eval）",
+    )
     
     args = ap.parse_args()
+
+    if args.fast_debug:
+        args.esm_eval_max_items = min(args.esm_eval_max_items, 20)
+        args.s1_steps = 0
+        args.s2_steps = 0
+        print("[info] fast_debug enabled: using reduced ESM eval sizes", flush=True)
+
+    args = _apply_esm_30gb_profile(args)
 
     if model_id is not None:
         args.model_id = model_id
@@ -2978,8 +3060,6 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         global_task_type = TaskType.FEATURE_EXTRACTION
     else:
         global_task_type = TaskType.CAUSAL_LM
-    
-    print(f"[info] global_task_type = {global_task_type}", flush=True)
 
     # Qwen/Qwen2.5-1.5B / meta-llama/Llama-3.1-8B
     if args.model_id == 'Qwen/Qwen2.5-1.5B':
@@ -2998,6 +3078,31 @@ def make_lora_ft(cfg_path, model_id=None, out_dir=None):
         args.s2_steps = 300
     elif args.model_id == 'meta-llama/Llama-3.2-3B':
         args.s2_steps = 500
+    elif args.model_id == 'facebook/esm2_t36_3B_UR50D':
+        args.model_family = 'esm2'
+        args.configs_path = 'configs/esm_stageC_lora_sweep.json'
+        args.out_dir = 'runs/esm_fluorescence_smoke'
+        args.esm_model_name = 'esm2_t36_3B_UR50D'
+        args.esm_local_model_pt = './assets/models/esm2_t36_3B_UR50D/esm2_t36_3B_UR50D.pt'
+        args.hf_dataset_id = "SaProtHub/Dataset-Fluorescence-TAPE"
+        args.label_field = 'label'
+        args.sequence_field = 'protein'
+        args.hf_split_column = 'stage'
+        args.hf_split_seed = 42
+        args.reg_loss = 'mse'
+        args.head_warmstart_mode = 'auto'
+        args.s1_steps = 800
+        args.s2_steps = 0
+        args.s1_lr = 1e-3
+        args.s2_lr = 5e-4
+        args.s2_gate_delta = 0
+        args.bs = 16
+        args.ga = 4
+        args.esm_eval_bs = 1
+        args.esm_eval_max_items = 2048
+        args.seq_len = 256
+        args.eval_every = 800
+        args.head_warmstart_from = 'runs/esm_fluorescence_smoke/head_warmstart/head_e995af1218d2b599f9f4c132381e568e.pt'
 
     cleared = clear_esm_regression_caches(args.out_dir, getattr(args, "esm_cache_clear", "none"))
     if len(cleared) > 0:
